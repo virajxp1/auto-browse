@@ -28,7 +28,3 @@ class EnvLoadingTest(unittest.TestCase):
 
         self.assertEqual(client.api_key, "test_key")
         self.assertEqual(client.model_name, "test_model")
-
-
-if __name__ == "__main__":
-    unittest.main()
