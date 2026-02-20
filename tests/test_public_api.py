@@ -12,7 +12,3 @@ class PublicApiTest(unittest.TestCase):
         self.assertTrue(hasattr(OpenRouterClient, "from_env"))
         self.assertIn("run_agent", auto_browse.__all__)
         self.assertIn("OpenRouterClient", auto_browse.__all__)
-
-
-if __name__ == "__main__":
-    unittest.main()
