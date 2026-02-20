@@ -60,11 +60,11 @@ Notes:
 
 - The API uses env credentials/model only (`OPENROUTER_API_KEY`, `OPENROUTER_MODEL`).
 - `start_url` accepts either a full URL (`https://...`) or a hostname (`www.google.com`), which is auto-normalized to `https://...`.
-- The API logs intermediary step summaries and next actions by default; set `"log_steps": false` to disable per request.
+- The API always logs intermediary step summaries and next actions.
 - Each run sends OpenRouter tracing metadata on every LLM step:
-  - `trace.trace_id` is generated automatically (UUIDv7) unless you pass `trace_id`.
+  - `trace.trace_id` is generated automatically (UUIDv7 fallback to UUID4).
   - `trace.generation_name` is set per step as `planner.1`, `planner.2`, ...
-  - `session_id` defaults to the same value as `trace_id` (or you can override it).
+  - `session_id` is generated internally to match `trace_id`.
 
 ## Deploy (Render Example)
 

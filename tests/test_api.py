@@ -69,6 +69,42 @@ class ApiTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 422)
 
+    def test_run_rejects_request_level_log_steps(self) -> None:
+        response = TestClient(app).post(
+            "/run",
+            json={
+                "start_url": "https://example.com",
+                "target_prompt": "release date",
+                "log_steps": False,
+            },
+        )
+
+        self.assertEqual(response.status_code, 422)
+
+    def test_run_rejects_request_level_trace_id(self) -> None:
+        response = TestClient(app).post(
+            "/run",
+            json={
+                "start_url": "https://example.com",
+                "target_prompt": "release date",
+                "trace_id": "trace-123",
+            },
+        )
+
+        self.assertEqual(response.status_code, 422)
+
+    def test_run_rejects_request_level_session_id(self) -> None:
+        response = TestClient(app).post(
+            "/run",
+            json={
+                "start_url": "https://example.com",
+                "target_prompt": "release date",
+                "session_id": "session-456",
+            },
+        )
+
+        self.assertEqual(response.status_code, 422)
+
     def test_run_normalizes_start_url_without_scheme(self) -> None:
         with (
             patch("auto_browse.api.OpenRouterClient.from_env", return_value=object()),
@@ -115,7 +151,7 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("Browser navigation failed", response.json()["detail"])
 
-    def test_run_can_disable_step_logging_callback(self) -> None:
+    def test_run_always_sets_step_logging_callback(self) -> None:
         with (
             patch("auto_browse.api.OpenRouterClient.from_env", return_value=object()),
             patch(
@@ -136,12 +172,11 @@ class ApiTest(unittest.TestCase):
                 json={
                     "start_url": "https://example.com",
                     "target_prompt": "release date",
-                    "log_steps": False,
                 },
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertIsNone(mock_run_agent.await_args.kwargs["on_step"])
+        self.assertTrue(callable(mock_run_agent.await_args.kwargs["on_step"]))
 
     def test_run_uses_generated_trace_id_when_missing(self) -> None:
         with (
@@ -171,62 +206,3 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(mock_run_agent.await_args.kwargs["trace_id"], "trace-generated")
         self.assertEqual(mock_run_agent.await_args.kwargs["session_id"], "trace-generated")
-
-    def test_run_forwards_trace_and_session_ids(self) -> None:
-        with (
-            patch("auto_browse.api.OpenRouterClient.from_env", return_value=object()),
-            patch(
-                "auto_browse.api.run_agent",
-                new=AsyncMock(
-                    return_value=AgentResult(
-                        answer="ok",
-                        source_url="https://example.com",
-                        evidence="ok",
-                        confidence=0.8,
-                        trace=[],
-                    )
-                ),
-            ) as mock_run_agent,
-        ):
-            response = TestClient(app).post(
-                "/run",
-                json={
-                    "start_url": "https://example.com",
-                    "target_prompt": "release date",
-                    "trace_id": "trace-123",
-                    "session_id": "session-456",
-                },
-            )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(mock_run_agent.await_args.kwargs["trace_id"], "trace-123")
-        self.assertEqual(mock_run_agent.await_args.kwargs["session_id"], "session-456")
-
-    def test_run_defaults_session_id_to_trace_id_when_not_provided(self) -> None:
-        with (
-            patch("auto_browse.api.OpenRouterClient.from_env", return_value=object()),
-            patch(
-                "auto_browse.api.run_agent",
-                new=AsyncMock(
-                    return_value=AgentResult(
-                        answer="ok",
-                        source_url="https://example.com",
-                        evidence="ok",
-                        confidence=0.8,
-                        trace=[],
-                    )
-                ),
-            ) as mock_run_agent,
-        ):
-            response = TestClient(app).post(
-                "/run",
-                json={
-                    "start_url": "https://example.com",
-                    "target_prompt": "release date",
-                    "trace_id": "trace-999",
-                },
-            )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(mock_run_agent.await_args.kwargs["trace_id"], "trace-999")
-        self.assertEqual(mock_run_agent.await_args.kwargs["session_id"], "trace-999")
