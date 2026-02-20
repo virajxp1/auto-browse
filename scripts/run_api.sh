@@ -12,6 +12,7 @@ fi
 
 HOST="${AUTO_BROWSE_API_HOST:-0.0.0.0}"
 PORT="${PORT:-${AUTO_BROWSE_API_PORT:-8000}}"
+LOG_LEVEL="${AUTO_BROWSE_API_LOG_LEVEL:-info}"
 
 # Set AUTO_BROWSE_INSTALL_PLAYWRIGHT=1 at startup if browser binaries are missing.
 if [[ "${AUTO_BROWSE_INSTALL_PLAYWRIGHT:-0}" == "1" ]]; then
@@ -19,7 +20,7 @@ if [[ "${AUTO_BROWSE_INSTALL_PLAYWRIGHT:-0}" == "1" ]]; then
 fi
 
 if [[ "${AUTO_BROWSE_API_RELOAD:-0}" == "1" ]]; then
-  exec python -m uvicorn auto_browse.api:app --host "${HOST}" --port "${PORT}" --reload
+  exec python -m uvicorn auto_browse.api:app --host "${HOST}" --port "${PORT}" --log-level "${LOG_LEVEL}" --reload
 fi
 
-exec python -m uvicorn auto_browse.api:app --host "${HOST}" --port "${PORT}"
+exec python -m uvicorn auto_browse.api:app --host "${HOST}" --port "${PORT}" --log-level "${LOG_LEVEL}"

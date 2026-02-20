@@ -11,7 +11,8 @@ from agent.models import AgentResult, AgentStepTrace
 from agent.openrouter_client import OpenRouterClient
 from agent.run import run_agent
 
-logger = logging.getLogger("auto_browse.api")
+# Use uvicorn's error logger so step logs show up in normal server output.
+logger = logging.getLogger("uvicorn.error")
 
 
 class RunRequest(BaseModel):
@@ -23,9 +24,8 @@ class RunRequest(BaseModel):
     headed: bool = False
     log_steps: bool = True
 
-    api_key: str | None = None
-    model_name: str | None = None
-    base_url: str = "https://openrouter.ai/api/v1"
+    trace_id: str | None = None
+    session_id: str | None = None
 
     @field_validator("start_url")
     @classmethod
@@ -38,20 +38,14 @@ class RunRequest(BaseModel):
         return trimmed
 
 
-def _client_from_request(request: RunRequest) -> OpenRouterClient:
-    has_inline_key = bool(request.api_key)
-    has_inline_model = bool(request.model_name)
-    if has_inline_key != has_inline_model:
-        raise HTTPException(
-            status_code=400,
-            detail="Provide both api_key and model_name together, or omit both.",
-        )
-    if has_inline_key and has_inline_model:
-        return OpenRouterClient(
-            api_key=request.api_key or "",
-            model_name=request.model_name or "",
-            base_url=request.base_url,
-        )
+def _new_trace_id() -> str:
+    uuid7_factory = getattr(uuid, "uuid7", None)
+    if callable(uuid7_factory):
+        return str(uuid7_factory())
+    return str(uuid.uuid4())
+
+
+def _client_from_env() -> OpenRouterClient:
     try:
         return OpenRouterClient.from_env()
     except ValueError as exc:
@@ -68,20 +62,24 @@ def create_app() -> FastAPI:
     @app.post("/run", response_model=AgentResult)
     async def run(payload: RunRequest) -> AgentResult:
         request_id = uuid.uuid4().hex[:8]
-        client = _client_from_request(payload)
+        trace_id = payload.trace_id or _new_trace_id()
+        session_id = payload.session_id or trace_id
+        client = _client_from_env()
 
         on_step = None
         if payload.log_steps:
             def _log_step(trace_item: AgentStepTrace) -> None:
                 logger.info(
-                    "[run:%s step:%s] summary=%s",
+                    "[run:%s trace:%s step:%s] summary=%s",
                     request_id,
+                    trace_id,
                     trace_item.step,
                     trace_item.decision.step_summary,
                 )
                 logger.info(
-                    "[run:%s step:%s] next=%s",
+                    "[run:%s trace:%s step:%s] next=%s",
                     request_id,
+                    trace_id,
                     trace_item.step,
                     trace_item.decision.next_step,
                 )
@@ -89,8 +87,10 @@ def create_app() -> FastAPI:
             on_step = _log_step
 
         logger.info(
-            "[run:%s] start url=%s max_steps=%s headed=%s",
+            "[run:%s trace:%s session:%s] start url=%s max_steps=%s headed=%s",
             request_id,
+            trace_id,
+            session_id,
             payload.start_url,
             payload.max_steps,
             payload.headed,
@@ -103,10 +103,14 @@ def create_app() -> FastAPI:
                 max_steps=payload.max_steps,
                 headless=not payload.headed,
                 on_step=on_step,
+                trace_id=trace_id,
+                session_id=session_id,
             )
             logger.info(
-                "[run:%s] finished error=%s answer_present=%s trace_steps=%s",
+                "[run:%s trace:%s session:%s] finished error=%s answer_present=%s trace_steps=%s",
                 request_id,
+                trace_id,
+                session_id,
                 result.error,
                 bool(result.answer),
                 len(result.trace),

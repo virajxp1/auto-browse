@@ -58,10 +58,13 @@ curl -X POST "http://127.0.0.1:8000/run" \
 
 Notes:
 
-- The API uses env credentials by default (`OPENROUTER_API_KEY`, `OPENROUTER_MODEL`).
-- You can override credentials per request by passing both `api_key` and `model_name` in JSON.
+- The API uses env credentials/model only (`OPENROUTER_API_KEY`, `OPENROUTER_MODEL`).
 - `start_url` accepts either a full URL (`https://...`) or a hostname (`www.google.com`), which is auto-normalized to `https://...`.
 - The API logs intermediary step summaries and next actions by default; set `"log_steps": false` to disable per request.
+- Each run sends OpenRouter tracing metadata on every LLM step:
+  - `trace.trace_id` is generated automatically (UUIDv7) unless you pass `trace_id`.
+  - `trace.generation_name` is set per step as `planner.1`, `planner.2`, ...
+  - `session_id` defaults to the same value as `trace_id` (or you can override it).
 
 ## Deploy (Render Example)
 
