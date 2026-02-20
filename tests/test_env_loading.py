@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent.planner import OpenRouterClient
+from agent.openrouter_client import OpenRouterClient
 
 
 class EnvLoadingTest(unittest.TestCase):

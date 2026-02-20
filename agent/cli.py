@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
 async def _run() -> int:
     args = parse_args()
 
-    from agent.planner import OpenRouterClient
+    from agent.openrouter_client import OpenRouterClient
     from agent.run import run_agent
 
     def _print_step(trace_item: AgentStepTrace) -> None:

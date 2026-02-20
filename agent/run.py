@@ -13,7 +13,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from agent.browser import capture_state, run_browser
 from agent.extract import page_to_markdown
 from agent.models import AgentDecision, AgentResult, AgentStepTrace, PageState
-from agent.planner import OpenRouterClient, build_llm_messages
+from agent.openrouter_client import OpenRouterClient
+from agent.planner import build_llm_messages
 
 StepCallback = Callable[[AgentStepTrace], None]
 
