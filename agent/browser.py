@@ -38,7 +38,7 @@ async def _is_visible(handle, *, require_enabled: bool = False) -> bool:
 async def _build_input_interactables(page: Page, limit: int = 10) -> list[Interactable]:
     interactables: list[Interactable] = []
     handles = await page.query_selector_all(_INPUT_QUERY)
-    for i, handle in enumerate(handles[:limit]):
+    for i, handle in enumerate(handles):
         if not await _is_visible(handle, require_enabled=True):
             continue
         try:
@@ -61,6 +61,8 @@ async def _build_input_interactables(page: Page, limit: int = 10) -> list[Intera
                 href=None,
             )
         )
+        if len(interactables) >= limit:
+            break
     return interactables
 
 
@@ -68,7 +70,7 @@ async def _build_button_interactables(page: Page, limit: int = 10) -> list[Inter
     interactables: list[Interactable] = []
     handles = await page.query_selector_all(_BUTTON_QUERY)
 
-    for i, handle in enumerate(handles[:limit]):
+    for i, handle in enumerate(handles):
         if not await _is_visible(handle, require_enabled=True):
             continue
         try:
@@ -91,6 +93,8 @@ async def _build_button_interactables(page: Page, limit: int = 10) -> list[Inter
                 href=None,
             )
         )
+        if len(interactables) >= limit:
+            break
 
     return interactables
 
@@ -98,7 +102,7 @@ async def _build_button_interactables(page: Page, limit: int = 10) -> list[Inter
 async def _build_link_interactables(page: Page, limit: int = 15) -> list[Interactable]:
     interactables: list[Interactable] = []
     handles = await page.query_selector_all(_LINK_QUERY)
-    for i, handle in enumerate(handles[:limit]):
+    for i, handle in enumerate(handles):
         if not await _is_visible(handle):
             continue
         try:
@@ -117,6 +121,8 @@ async def _build_link_interactables(page: Page, limit: int = 15) -> list[Interac
                 href=href,
             )
         )
+        if len(interactables) >= limit:
+            break
 
     return interactables
 

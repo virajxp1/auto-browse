@@ -233,8 +233,11 @@ def _build_graph(runtime: _Runtime):
         )
         if not isinstance(message, AIMessage):
             return _set_error(state, "llm_response_not_ai_message")
-        if not message.tool_calls:
+        tool_calls = message.tool_calls or []
+        if not tool_calls:
             return _set_error(state, "llm_returned_no_tool_call")
+        if len(tool_calls) != 1:
+            return _set_error(state, "llm_returned_multiple_tool_calls")
         state["messages"] = [message]
         return state
 
