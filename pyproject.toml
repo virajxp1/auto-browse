@@ -1,0 +1,25 @@
+[project]
+name = "auto-browse-mvp"
+version = "0.1.0"
+description = "Constrained browser agent MVP using Playwright + OpenRouter."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "langchain-openai>=0.2.0",
+  "langgraph>=0.2.0",
+  "markdownify>=0.14.1",
+  "playwright>=1.45.0",
+  "pydantic>=2.7.0",
+  "readability-lxml>=0.8.4.1",
+]
+
+[project.scripts]
+auto-browse = "auto_browse.cli:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agent*", "auto_browse*"]
