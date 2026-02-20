@@ -65,7 +65,6 @@ class _Runtime:
     max_steps: int
     on_step: StepCallback | None
     trace_id: str
-    session_id: str | None
 
 
 class AgentGraphState(TypedDict):
@@ -120,14 +119,13 @@ def _new_trace_id() -> str:
 def _openrouter_invoke_kwargs(runtime: _Runtime, step: int) -> dict[str, object]:
     generation_name = f"planner.{step + 1}"
     extra_body: dict[str, object] = {
+        "session_id": runtime.trace_id,
         "trace": {
             "trace_id": runtime.trace_id,
             "trace_name": "auto_browse_agent_run",
             "generation_name": generation_name,
         }
     }
-    if runtime.session_id:
-        extra_body["session_id"] = runtime.session_id
     return {"extra_body": extra_body}
 
 
@@ -348,7 +346,6 @@ async def run_agent(
     headless: bool = True,
     on_step: StepCallback | None = None,
     trace_id: str | None = None,
-    session_id: str | None = None,
 ) -> AgentResult:
     pw, browser, page = await run_browser(start_url, headless=headless)
     resolved_trace_id = trace_id or _new_trace_id()
@@ -359,7 +356,6 @@ async def run_agent(
         max_steps=max_steps,
         on_step=on_step,
         trace_id=resolved_trace_id,
-        session_id=session_id,
     )
     graph = _build_graph(runtime)
 

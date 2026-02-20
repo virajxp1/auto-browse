@@ -40,10 +40,7 @@ class ApiTest(unittest.TestCase):
         mock_from_env.assert_called_once()
         mock_run_agent.assert_awaited_once()
         self.assertTrue(callable(mock_run_agent.await_args.kwargs["on_step"]))
-        trace_id = mock_run_agent.await_args.kwargs["trace_id"]
-        session_id = mock_run_agent.await_args.kwargs["session_id"]
-        self.assertIsInstance(trace_id, str)
-        self.assertEqual(session_id, trace_id)
+        self.assertIsInstance(mock_run_agent.await_args.kwargs["trace_id"], str)
 
     def test_run_rejects_request_level_api_key(self) -> None:
         response = TestClient(app).post(
@@ -205,4 +202,3 @@ class ApiTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(mock_run_agent.await_args.kwargs["trace_id"], "trace-generated")
-        self.assertEqual(mock_run_agent.await_args.kwargs["session_id"], "trace-generated")

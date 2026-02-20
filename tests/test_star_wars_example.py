@@ -129,13 +129,12 @@ class StarWarsExampleTest(unittest.IsolatedAsyncioTestCase):
                 target_prompt="release date",
                 max_steps=3,
                 trace_id="trace-123",
-                session_id="session-abc",
             )
 
         self.assertIsNone(result.error)
         self.assertEqual(len(client._chat_model.invocations), 1)
         invocation = client._chat_model.invocations[0]
-        self.assertEqual(invocation["extra_body"]["session_id"], "session-abc")
+        self.assertEqual(invocation["extra_body"]["session_id"], "trace-123")
         self.assertEqual(invocation["extra_body"]["trace"]["trace_id"], "trace-123")
         self.assertEqual(invocation["extra_body"]["trace"]["trace_name"], "auto_browse_agent_run")
         self.assertEqual(invocation["extra_body"]["trace"]["generation_name"], "planner.1")

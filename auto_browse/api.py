@@ -59,7 +59,6 @@ def create_app() -> FastAPI:
     async def run(payload: RunRequest) -> AgentResult:
         request_id = uuid.uuid4().hex[:8]
         trace_id = _new_trace_id()
-        session_id = trace_id
         client = _client_from_env()
 
         def _log_step(trace_item: AgentStepTrace) -> None:
@@ -79,10 +78,9 @@ def create_app() -> FastAPI:
             )
 
         logger.info(
-            "[run:%s trace:%s session:%s] start url=%s max_steps=%s headed=%s",
+            "[run:%s trace:%s] start url=%s max_steps=%s headed=%s",
             request_id,
             trace_id,
-            session_id,
             payload.start_url,
             payload.max_steps,
             payload.headed,
@@ -96,13 +94,11 @@ def create_app() -> FastAPI:
                 headless=not payload.headed,
                 on_step=_log_step,
                 trace_id=trace_id,
-                session_id=session_id,
             )
             logger.info(
-                "[run:%s trace:%s session:%s] finished error=%s answer_present=%s trace_steps=%s",
+                "[run:%s trace:%s] finished error=%s answer_present=%s trace_steps=%s",
                 request_id,
                 trace_id,
-                session_id,
                 result.error,
                 bool(result.answer),
                 len(result.trace),
