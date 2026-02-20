@@ -1,0 +1,2 @@
+"""Auto-browse MVP package."""
+
