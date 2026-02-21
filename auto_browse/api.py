@@ -49,7 +49,7 @@ def _client_from_env() -> OpenRouterClient:
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Auto Browse API", version="0.1.0")
+    app = FastAPI(title="auto-browse API", version="0.1.0")
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -85,6 +85,7 @@ def create_app() -> FastAPI:
             payload.max_steps,
             payload.headed,
         )
+
         try:
             result = await run_agent(
                 client,
@@ -95,6 +96,12 @@ def create_app() -> FastAPI:
                 on_step=_log_step,
                 trace_id=trace_id,
             )
+        except PlaywrightError as exc:
+            raise HTTPException(status_code=400, detail=f"Browser navigation failed: {exc}") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        if result.error:
             logger.info(
                 "[run:%s trace:%s] finished error=%s answer_present=%s trace_steps=%s",
                 request_id,
@@ -103,9 +110,17 @@ def create_app() -> FastAPI:
                 bool(result.answer),
                 len(result.trace),
             )
-            return result
-        except PlaywrightError as exc:
-            raise HTTPException(status_code=400, detail=f"Browser navigation failed: {exc}") from exc
+            raise HTTPException(status_code=422, detail=result.model_dump())
+
+        logger.info(
+            "[run:%s trace:%s] finished error=%s answer_present=%s trace_steps=%s",
+            request_id,
+            trace_id,
+            result.error,
+            bool(result.answer),
+            len(result.trace),
+        )
+        return result
 
     return app
 

@@ -3,7 +3,7 @@ name = "auto-browse-mvp"
 version = "0.1.0"
 description = "Constrained browser agent MVP using Playwright + OpenRouter."
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11,<3.15"
 dependencies = [
   "fastapi>=0.116.0",
   "langchain-openai>=0.2.0",
