@@ -23,11 +23,13 @@ class _StubChatModel:
     def __init__(self, tool_call_responses):
         self._tool_call_responses = tool_call_responses
         self._index = 0
+        self.invocations = []
 
     def bind_tools(self, _tools, **_kwargs):
         return self
 
-    async def ainvoke(self, _messages):
+    async def ainvoke(self, _messages, **kwargs):
+        self.invocations.append(kwargs)
         if self._index < len(self._tool_call_responses):
             tool_calls = self._tool_call_responses[self._index]
             self._index += 1
@@ -41,10 +43,10 @@ class _StubChatModel:
 
 class _StubOpenRouterClient:
     def __init__(self, tool_call_responses):
-        self._tool_call_responses = tool_call_responses
+        self._chat_model = _StubChatModel(tool_call_responses)
 
     def chat_model(self):
-        return _StubChatModel(self._tool_call_responses)
+        return self._chat_model
 
 
 class _DummyClickPage:
@@ -220,6 +222,40 @@ class StarWarsExampleTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result.trace[0].decision.next_step, "Return extracted answer now.")
         self.assertEqual(len(step_updates), 1)
+
+    async def test_passes_trace_metadata_on_each_llm_invocation(self) -> None:
+        state = PageState(
+            url="https://example.com",
+            title="Example",
+            markdown="",
+            interactables=[],
+        )
+        markdown = "# Example\n\nTest page\n"
+        client = _StubOpenRouterClient([[_extract_tool_call()]])
+
+        with (
+            patch(
+                "agent.run.run_browser",
+                new=AsyncMock(return_value=(_DummyPlaywright(), _DummyBrowser(), object())),
+            ),
+            patch("agent.run.capture_state", new=AsyncMock(return_value=state)),
+            patch("agent.run.page_to_markdown", new=AsyncMock(return_value=markdown)),
+        ):
+            result = await run_agent(
+                openrouter_client=client,
+                start_url="https://example.com",
+                target_prompt="release date",
+                max_steps=3,
+                trace_id="trace-123",
+            )
+
+        self.assertIsNone(result.error)
+        self.assertEqual(len(client._chat_model.invocations), 1)
+        invocation = client._chat_model.invocations[0]
+        self.assertEqual(invocation["extra_body"]["session_id"], "trace-123")
+        self.assertEqual(invocation["extra_body"]["trace"]["trace_id"], "trace-123")
+        self.assertEqual(invocation["extra_body"]["trace"]["trace_name"], "auto_browse_agent_run")
+        self.assertEqual(invocation["extra_body"]["trace"]["generation_name"], "planner.1")
 
     async def test_rejects_multiple_tool_calls_in_one_turn(self) -> None:
         state = PageState(

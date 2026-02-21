@@ -1,44 +1,128 @@
 from __future__ import annotations
 
+import logging
+import uuid
+
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from playwright.async_api import Error as PlaywrightError
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from auto_browse import OpenRouterClient, run_agent
+from agent.models import AgentResult, AgentStepTrace
+from agent.openrouter_client import OpenRouterClient
+from agent.run import run_agent
 
-app = FastAPI(title="auto-browse API", version="0.1.0")
+# Use uvicorn's error logger so step logs show up in normal server output.
+logger = logging.getLogger("uvicorn.error")
 
 
 class RunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
     start_url: str
     target_prompt: str
-    max_steps: int = Field(default=10, ge=1, le=100)
+    max_steps: int = Field(default=10, ge=1, le=50)
     headed: bool = False
 
+    @field_validator("start_url")
+    @classmethod
+    def normalize_start_url(cls, value: str) -> str:
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("start_url cannot be empty")
+        if "://" not in trimmed:
+            return f"https://{trimmed}"
+        return trimmed
 
-@app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+
+def _new_trace_id() -> str:
+    uuid7_factory = getattr(uuid, "uuid7", None)
+    if callable(uuid7_factory):
+        return str(uuid7_factory())
+    return str(uuid.uuid4())
 
 
-@app.post("/run")
-async def run(request: RunRequest) -> dict:
+def _client_from_env() -> OpenRouterClient:
     try:
-        client = OpenRouterClient.from_env()
-        result = await run_agent(
-            client,
-            start_url=request.start_url,
-            target_prompt=request.target_prompt,
-            max_steps=request.max_steps,
-            headless=not request.headed,
-        )
+        return OpenRouterClient.from_env()
     except ValueError as exc:
-        message = str(exc)
-        status_code = 500 if message.startswith("Missing required environment variable") else 400
-        raise HTTPException(status_code=status_code, detail=message) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"agent_failed: {exc}") from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    if result.error:
-        raise HTTPException(status_code=422, detail=result.model_dump())
 
-    return result.model_dump()
+def create_app() -> FastAPI:
+    app = FastAPI(title="auto-browse API", version="0.1.0")
+
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.post("/run", response_model=AgentResult)
+    async def run(payload: RunRequest) -> AgentResult:
+        request_id = uuid.uuid4().hex[:8]
+        trace_id = _new_trace_id()
+        client = _client_from_env()
+
+        def _log_step(trace_item: AgentStepTrace) -> None:
+            logger.info(
+                "[run:%s trace:%s step:%s] summary=%s",
+                request_id,
+                trace_id,
+                trace_item.step,
+                trace_item.decision.step_summary,
+            )
+            logger.info(
+                "[run:%s trace:%s step:%s] next=%s",
+                request_id,
+                trace_id,
+                trace_item.step,
+                trace_item.decision.next_step,
+            )
+
+        logger.info(
+            "[run:%s trace:%s] start url=%s max_steps=%s headed=%s",
+            request_id,
+            trace_id,
+            payload.start_url,
+            payload.max_steps,
+            payload.headed,
+        )
+
+        try:
+            result = await run_agent(
+                client,
+                start_url=payload.start_url,
+                target_prompt=payload.target_prompt,
+                max_steps=payload.max_steps,
+                headless=not payload.headed,
+                on_step=_log_step,
+                trace_id=trace_id,
+            )
+        except PlaywrightError as exc:
+            raise HTTPException(status_code=400, detail=f"Browser navigation failed: {exc}") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        if result.error:
+            logger.info(
+                "[run:%s trace:%s] finished error=%s answer_present=%s trace_steps=%s",
+                request_id,
+                trace_id,
+                result.error,
+                bool(result.answer),
+                len(result.trace),
+            )
+            raise HTTPException(status_code=422, detail=result.model_dump())
+
+        logger.info(
+            "[run:%s trace:%s] finished error=%s answer_present=%s trace_steps=%s",
+            request_id,
+            trace_id,
+            result.error,
+            bool(result.answer),
+            len(result.trace),
+        )
+        return result
+
+    return app
+
+
+app = create_app()

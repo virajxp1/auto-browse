@@ -7,13 +7,11 @@ from pathlib import Path
 from langchain_openai import ChatOpenAI
 
 
-def _get_required_env(*names: str) -> str:
-    for name in names:
-        value = os.getenv(name, "").strip()
-        if value:
-            return value
-    joined = ", ".join(names)
-    raise ValueError(f"Missing required environment variable. Expected one of: {joined}")
+def _get_required_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if value:
+        return value
+    raise ValueError(f"Missing required environment variable: {name}")
 
 
 def _load_env_file_if_present(path: Path = Path(".env")) -> None:
@@ -46,19 +44,18 @@ def _load_env_file_if_present(path: Path = Path(".env")) -> None:
 class OpenRouterClient:
     api_key: str
     model_name: str
-    base_url: str = "https://openrouter.ai/api/v1"
 
     @classmethod
     def from_env(cls) -> "OpenRouterClient":
         _load_env_file_if_present()
-        api_key = _get_required_env("OPENROUTER_API_KEY", "OPEN_ROUTER_API_KEY")
-        model_name = _get_required_env("OPENROUTER_MODEL", "LLM_MODEL_NAME")
+        api_key = _get_required_env("OPENROUTER_API_KEY")
+        model_name = _get_required_env("OPENROUTER_MODEL")
         return cls(api_key=api_key, model_name=model_name)
 
     def chat_model(self) -> ChatOpenAI:
         return ChatOpenAI(
             model=self.model_name,
             api_key=self.api_key,
-            base_url=self.base_url,
+            base_url="https://openrouter.ai/api/v1",
             temperature=0,
         )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from typing import Awaitable, Callable, TypedDict
 
@@ -61,6 +62,7 @@ class _Runtime:
     target_prompt: str
     max_steps: int
     on_step: StepCallback | None
+    trace_id: str
 
 
 class AgentGraphState(TypedDict):
@@ -165,6 +167,26 @@ def _fail_decision_json(reason: str, step_summary: str, next_step: str) -> str:
         step_summary=step_summary,
         next_step=next_step,
     ).model_dump_json()
+
+
+def _new_trace_id() -> str:
+    uuid7_factory = getattr(uuid, "uuid7", None)
+    if callable(uuid7_factory):
+        return str(uuid7_factory())
+    return str(uuid.uuid4())
+
+
+def _openrouter_invoke_kwargs(runtime: _Runtime, step: int) -> dict[str, object]:
+    generation_name = f"planner.{step + 1}"
+    extra_body: dict[str, object] = {
+        "session_id": runtime.trace_id,
+        "trace": {
+            "trace_id": runtime.trace_id,
+            "trace_name": "auto_browse_agent_run",
+            "generation_name": generation_name,
+        }
+    }
+    return {"extra_body": extra_body}
 
 
 def _build_tools(runtime: _Runtime):
@@ -408,7 +430,8 @@ def _build_graph(runtime: _Runtime):
             history=state["trace"],
         )
         message = await llm_with_tools.ainvoke(
-            base_messages
+            base_messages,
+            **_openrouter_invoke_kwargs(runtime, state["step"]),
         )
         if not isinstance(message, AIMessage):
             return _set_error(state, "llm_response_not_ai_message")
@@ -425,7 +448,8 @@ def _build_graph(runtime: _Runtime):
                             "Do not repeat a blocked or identical previous action."
                         )
                     )
-                ]
+                ],
+                **_openrouter_invoke_kwargs(runtime, state["step"]),
             )
             if isinstance(retry_message, AIMessage):
                 message = retry_message
@@ -514,14 +538,17 @@ async def run_agent(
     max_steps: int = 10,
     headless: bool = True,
     on_step: StepCallback | None = None,
+    trace_id: str | None = None,
 ) -> AgentResult:
     pw, browser, page = await run_browser(start_url, headless=headless)
+    resolved_trace_id = trace_id or _new_trace_id()
     runtime = _Runtime(
         openrouter_client=openrouter_client,
         page=page,
         target_prompt=target_prompt,
         max_steps=max_steps,
         on_step=on_step,
+        trace_id=resolved_trace_id,
     )
     graph = _build_graph(runtime)
 
