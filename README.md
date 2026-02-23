@@ -173,43 +173,39 @@ Task schema supports optional behavior assertions:
 
 ## Documented Successes and Failures (Observed)
 
-The following results were observed in local API eval runs on **February 21, 2026**.
+The following results were observed in API eval runs on **February 23, 2026**.
 They are run logs from this repo's current implementation, not permanent guarantees.
 
-### Baseline Suite (`evals/tasks.json`)
+### Complex Suite (`evals/tasks_complex.json`, Google-start)
 
-- Result: **18/20 passed** (`90%` success, `repeats=1`, API mode).
-- Typical behavior:
-  - Most successful tasks complete in **1 step** (`extract`) on already-correct pages.
-  - Examples:
-    - `example_domain_heading` -> `Example Domain`
-    - `wiki_star_wars_title` -> `Star Wars (film)`
-    - `python_infobox_schema` -> structured extraction from infobox
+- Full run report: `.context/eval_report_google_start_complex_api_full.json`
+- Result: **8/10 passed** (`80%` success, `repeats=1`, API mode).
+- Step behavior in successful runs:
+  - `median_steps_success = 2`
+  - Multi-step examples include `type_and_submit + click + extract` and `navigate + extract`.
+- Successful examples:
+  - `ddg_search_openai_docs_title` -> `type_and_submit + click + extract` -> `OpenAI API Platform Documentation`
+  - `ddg_search_python_wiki_title` -> `type_and_submit + click + extract` -> `Python (programming language)`
+  - `navigate_then_schema_star_wars` -> `navigate + extract` with structured infobox fields
+  - `schema_python_infobox` -> structured extraction (`designer`, `first_appeared`)
 - Failures in this run:
-  - `wiki_nasa_title` -> `422`, `tool_execution_failed`
-  - `star_wars_infobox_schema` -> `422`, `Infobox content not present in provided page text`
+  - `example_click_to_iana_title` -> `click_failed`
+  - `wikipedia_search_un_title` -> `max_steps_exceeded` after repeated navigation/click attempts
 
-### Complex Suite (`evals/tasks_complex.json`)
+### Fresh-State Fix Sanity Slice (first 5 complex tasks)
 
-- Result: **4/10 passed** (`40%` success, `repeats=1`, API mode).
-- This suite enforces multi-step/behavior constraints (`min_trace_steps`, `required_actions`), and does trigger deeper traces:
-  - Step distribution in one run: `{1: 1, 2: 7, 3: 1, 8: 1}`
-  - Maximum observed trace depth: `8` steps
-- Successful complex examples:
-  - `example_navigate_to_iana_title` -> `navigate + extract` (2 steps)
-  - `iana_navigate_to_example_heading` -> `navigate + extract` (2 steps)
-  - `wikipedia_search_un_title` -> `type_and_submit + extract` (2 steps)
-- Where it currently falls short:
-  - `example_click_to_iana_title` -> `click` followed by `navigate_failed`
-  - `ddg_search_openai_docs_title` and `ddg_search_python_wiki_title` -> `type_and_submit_failed`
-  - `wikipedia_search_nasa_title` -> `max_steps_exceeded` after repeated actions
-  - `schema_star_wars_infobox` and `navigate_then_schema_star_wars` returned HTTP `200` but failed eval expectations (`expected_contains_mismatch`)
+- Report: `.context/eval_report_google_start_complex_limit5_after_fresh_state_fix.json`
+- Result: **4/5 passed** (`80%` success, API mode).
+- Shows stable passes on:
+  - direct navigation tasks
+  - Google search + click workflows
+- Remaining miss in this slice:
+  - `example_click_to_iana_title` (still unreliable on click-driven transition)
 
 ### What This Means
 
-- The agent is strong on straightforward extraction and some navigation flows.
-- Complex, search-driven, and selector-sensitive workflows are still the main reliability gap.
-- The complex suite now measures these gaps directly and is the better indicator for progress on multi-step capability.
+- The agent now handles substantially more multi-step tasks than earlier runs, including search-driven flows.
+- The remaining primary gap is robust click-driven progression on some pages, which is the highest-value next reliability target.
 
 ## Notes
 
