@@ -1,0 +1,118 @@
+[
+  {
+    "id": "example_click_to_iana_title",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google to open example.com, click the \"Learn more\" link, and report the destination page title.",
+    "max_steps": 8,
+    "max_actions_per_step": 3,
+    "min_trace_steps": 2,
+    "required_actions": ["click", "extract"],
+    "expected_contains": ["Example Domains"]
+  },
+  {
+    "id": "example_navigate_to_iana_title",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Starting from Google, navigate directly to https://www.iana.org/domains/reserved and report that page title.",
+    "max_steps": 8,
+    "max_actions_per_step": 3,
+    "min_trace_steps": 2,
+    "required_actions": ["navigate", "extract"],
+    "expected_contains": ["IANA-managed Reserved Domains"]
+  },
+  {
+    "id": "iana_navigate_to_example_heading",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Starting from Google, navigate to https://example.com and extract the main heading text.",
+    "max_steps": 8,
+    "max_actions_per_step": 3,
+    "min_trace_steps": 2,
+    "required_actions": ["navigate", "extract"],
+    "expected_contains": ["Example Domain"]
+  },
+  {
+    "id": "ddg_search_openai_docs_title",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google search to find OpenAI API Platform documentation, open the most relevant result, and return the destination page title.",
+    "max_steps": 10,
+    "max_actions_per_step": 4,
+    "min_trace_steps": 3,
+    "required_actions": ["type_and_submit", "click", "extract"],
+    "expected_contains": ["OpenAI API Platform"]
+  },
+  {
+    "id": "ddg_search_python_wiki_title",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google search to find the Wikipedia page for Python programming language, open it, and report the article title.",
+    "max_steps": 10,
+    "max_actions_per_step": 4,
+    "min_trace_steps": 3,
+    "required_actions": ["type_and_submit", "click", "extract"],
+    "expected_contains": ["Python (programming language)"]
+  },
+  {
+    "id": "wikipedia_search_nasa_title",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google search to find the Wikipedia page for NASA and return the article title.",
+    "max_steps": 8,
+    "max_actions_per_step": 3,
+    "min_trace_steps": 2,
+    "required_actions": ["type_and_submit", "extract"],
+    "expected_contains": ["NASA"]
+  },
+  {
+    "id": "wikipedia_search_un_title",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google search to find the Wikipedia page for United Nations and return the article title.",
+    "max_steps": 8,
+    "max_actions_per_step": 3,
+    "min_trace_steps": 2,
+    "required_actions": ["type_and_submit", "extract"],
+    "expected_contains": ["United Nations"]
+  },
+  {
+    "id": "schema_star_wars_infobox",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google to open the Wikipedia page for Star Wars (film), then extract release_date, director, and producer from the infobox.",
+    "max_steps": 6,
+    "max_actions_per_step": 2,
+    "min_trace_steps": 1,
+    "required_actions": ["extract"],
+    "extraction_schema": {
+      "release_date": "The theatrical release date",
+      "director": "The film director",
+      "producer": "The film producer"
+    },
+    "extraction_selector": "css=table.infobox",
+    "expected_contains": ["1977", "George Lucas", "Gary Kurtz"]
+  },
+  {
+    "id": "schema_python_infobox",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google to open the Wikipedia page for Python (programming language), then extract designer and first_appeared from the infobox.",
+    "max_steps": 6,
+    "max_actions_per_step": 2,
+    "min_trace_steps": 1,
+    "required_actions": ["extract"],
+    "extraction_schema": {
+      "designer": "The primary language designer",
+      "first_appeared": "The year of first appearance"
+    },
+    "extraction_selector": "css=table.infobox",
+    "expected_contains": ["Guido van Rossum", "1991"]
+  },
+  {
+    "id": "navigate_then_schema_star_wars",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Navigate to https://en.wikipedia.org/wiki/Star_Wars_(film) and extract release_date and director from the infobox.",
+    "max_steps": 10,
+    "max_actions_per_step": 3,
+    "min_trace_steps": 2,
+    "required_actions": ["navigate", "extract"],
+    "extraction_schema": {
+      "release_date": "The theatrical release date",
+      "director": "The film director"
+    },
+    "extraction_selector": "css=table.infobox",
+    "expected_contains": ["1977", "George Lucas"]
+  }
+]

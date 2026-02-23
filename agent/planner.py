@@ -4,15 +4,24 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from agent.models import AgentDecision, AgentStepTrace, PageState
 
-SYSTEM_PROMPT = """You are a web extraction agent.
-You MUST call exactly one tool on every turn.
+def _build_system_prompt(max_actions_per_step: int) -> str:
+    if max_actions_per_step <= 1:
+        action_rule = "You MUST call exactly one tool on every turn."
+    else:
+        action_rule = (
+            "You MUST call at least one tool on every turn. "
+            f"You may call up to {max_actions_per_step} tools in order."
+        )
+
+    return f"""You are a web extraction agent.
+{action_rule}
 Never respond with plain text.
 
 Available tools:
 - type_and_submit(selector, text, step_summary, next_step)
 - click(selector, step_summary, next_step)
 - navigate(url, step_summary, next_step)
-- extract_answer(answer, evidence, confidence, step_summary, next_step)
+- extract_answer(answer, structured_data, evidence, confidence, step_summary, next_step)
 - fail(reason, step_summary, next_step)
 
 Rules:
@@ -42,6 +51,8 @@ def _decision_params_text(decision: AgentDecision) -> str:
         parts.append(f"reason={decision.reason}")
     if decision.answer:
         parts.append(f"answer={decision.answer}")
+    if decision.structured_data:
+        parts.append(f"structured_data_keys={','.join(sorted(decision.structured_data.keys()))}")
     return " | ".join(parts) if parts else "none"
 
 
@@ -96,7 +107,15 @@ def _build_blocker_alerts(state: PageState) -> str:
     return "\n".join(lines)
 
 
-def build_prompt(state: PageState, target: str, history: list[AgentStepTrace] | None = None) -> str:
+def build_prompt(
+    state: PageState,
+    target: str,
+    history: list[AgentStepTrace] | None = None,
+    *,
+    extraction_schema: dict[str, str] | None = None,
+    extraction_selector: str | None = None,
+    max_actions_per_step: int = 1,
+) -> str:
     interactables = "\n".join(
         (
             f"- {item.kind}: {item.label} | selector={item.selector}"
@@ -122,6 +141,28 @@ def build_prompt(state: PageState, target: str, history: list[AgentStepTrace] | 
         loop_alerts_text = _build_loop_alerts(history)
 
     markdown = state.markdown[:8000]
+    if extraction_schema:
+        schema_lines = "\n".join(
+            f"- {field_name}: {field_description}"
+            for field_name, field_description in extraction_schema.items()
+        )
+        extraction_mode_text = (
+            "mode=schema\n"
+            "When calling extract_answer you MUST populate structured_data with exactly these keys:\n"
+            f"{schema_lines}\n"
+            "You may set value to null if evidence is unavailable."
+        )
+    else:
+        extraction_mode_text = (
+            "mode=answer\n"
+            "When calling extract_answer, populate the answer field with the final extracted answer."
+        )
+
+    extraction_scope_text = extraction_selector or "none"
+    if max_actions_per_step <= 1:
+        action_budget_text = "exactly one tool"
+    else:
+        action_budget_text = f"between 1 and {max_actions_per_step} tool calls"
 
     return f"""TARGET:
 {target}
@@ -145,15 +186,38 @@ LOOP ALERTS:
 BLOCKER ALERTS:
 {blocker_alerts_text}
 
-Call exactly one tool now.
+EXTRACTION MODE:
+{extraction_mode_text}
+
+EXTRACTION SCOPE SELECTOR:
+{extraction_scope_text}
+
+ACTION BUDGET:
+{action_budget_text}
+
+Call {action_budget_text} now.
 """
+
 
 def build_llm_messages(
     state: PageState,
     target: str,
     history: list[AgentStepTrace] | None = None,
+    *,
+    extraction_schema: dict[str, str] | None = None,
+    extraction_selector: str | None = None,
+    max_actions_per_step: int = 1,
 ):
     return [
-        SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=build_prompt(state, target, history=history)),
+        SystemMessage(content=_build_system_prompt(max_actions_per_step)),
+        HumanMessage(
+            content=build_prompt(
+                state,
+                target,
+                history=history,
+                extraction_schema=extraction_schema,
+                extraction_selector=extraction_selector,
+                max_actions_per_step=max_actions_per_step,
+            )
+        ),
     ]

@@ -202,3 +202,51 @@ class ApiTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(mock_run_agent.await_args.kwargs["trace_id"], "trace-generated")
+
+    def test_run_passes_extraction_and_action_budget_options(self) -> None:
+        with (
+            patch("auto_browse.api.OpenRouterClient.from_env", return_value=object()),
+            patch(
+                "auto_browse.api.run_agent",
+                new=AsyncMock(
+                    return_value=AgentResult(
+                        answer=None,
+                        structured_data={
+                            "release_date": "May 25, 1977",
+                            "director": "George Lucas",
+                        },
+                        source_url="https://example.com",
+                        evidence="Infobox data",
+                        confidence=0.8,
+                        trace=[],
+                    )
+                ),
+            ) as mock_run_agent,
+        ):
+            response = TestClient(app).post(
+                "/run",
+                json={
+                    "start_url": "https://example.com",
+                    "target_prompt": "Extract release date and director",
+                    "max_actions_per_step": 3,
+                    "extraction_selector": "css=table.infobox",
+                    "extraction_schema": {
+                        "release_date": "The theatrical release date",
+                        "director": "The director name",
+                    },
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_run_agent.await_args.kwargs["max_actions_per_step"], 3)
+        self.assertEqual(
+            mock_run_agent.await_args.kwargs["extraction_selector"],
+            "css=table.infobox",
+        )
+        self.assertEqual(
+            mock_run_agent.await_args.kwargs["extraction_schema"],
+            {
+                "release_date": "The theatrical release date",
+                "director": "The director name",
+            },
+        )
