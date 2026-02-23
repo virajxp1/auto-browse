@@ -7,11 +7,13 @@ from pathlib import Path
 from langchain_openai import ChatOpenAI
 
 
-def _get_required_env(name: str) -> str:
-    value = os.getenv(name, "").strip()
-    if value:
-        return value
-    raise ValueError(f"Missing required environment variable: {name}")
+def _get_required_env_any(names: list[str]) -> str:
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    joined = ", ".join(names)
+    raise ValueError(f"Missing required environment variable: one of [{joined}]")
 
 
 def _load_env_file_if_present(path: Path = Path(".env")) -> None:
@@ -48,8 +50,8 @@ class OpenRouterClient:
     @classmethod
     def from_env(cls) -> "OpenRouterClient":
         _load_env_file_if_present()
-        api_key = _get_required_env("OPENROUTER_API_KEY")
-        model_name = _get_required_env("OPENROUTER_MODEL")
+        api_key = _get_required_env_any(["OPENROUTER_API_KEY", "OPEN_ROUTER_API_KEY"])
+        model_name = _get_required_env_any(["OPENROUTER_MODEL"])
         return cls(api_key=api_key, model_name=model_name)
 
     def chat_model(self) -> ChatOpenAI:

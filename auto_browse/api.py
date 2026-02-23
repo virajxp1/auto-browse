@@ -21,6 +21,9 @@ class RunRequest(BaseModel):
     start_url: str
     target_prompt: str
     max_steps: int = Field(default=10, ge=1, le=50)
+    max_actions_per_step: int = Field(default=1, ge=1, le=4)
+    extraction_schema: dict[str, str] | None = None
+    extraction_selector: str | None = None
     headed: bool = False
 
     @field_validator("start_url")
@@ -31,6 +34,37 @@ class RunRequest(BaseModel):
             raise ValueError("start_url cannot be empty")
         if "://" not in trimmed:
             return f"https://{trimmed}"
+        return trimmed
+
+    @field_validator("extraction_schema")
+    @classmethod
+    def validate_extraction_schema(
+        cls,
+        value: dict[str, str] | None,
+    ) -> dict[str, str] | None:
+        if value is None:
+            return None
+        if not value:
+            raise ValueError("extraction_schema cannot be empty")
+        normalized: dict[str, str] = {}
+        for key, description in value.items():
+            normalized_key = key.strip()
+            normalized_description = description.strip()
+            if not normalized_key:
+                raise ValueError("extraction_schema keys must be non-empty")
+            if not normalized_description:
+                raise ValueError("extraction_schema values must be non-empty")
+            normalized[normalized_key] = normalized_description
+        return normalized
+
+    @field_validator("extraction_selector")
+    @classmethod
+    def normalize_extraction_selector(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("extraction_selector cannot be empty")
         return trimmed
 
 
@@ -92,6 +126,9 @@ def create_app() -> FastAPI:
                 start_url=payload.start_url,
                 target_prompt=payload.target_prompt,
                 max_steps=payload.max_steps,
+                max_actions_per_step=payload.max_actions_per_step,
+                extraction_schema=payload.extraction_schema,
+                extraction_selector=payload.extraction_selector,
                 headless=not payload.headed,
                 on_step=_log_step,
                 trace_id=trace_id,

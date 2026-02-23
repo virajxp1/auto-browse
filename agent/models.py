@@ -34,6 +34,7 @@ class AgentDecision(StrictModel):
     reason: str | None = None
 
     answer: str | None = None
+    structured_data: dict[str, str | None] | None = None
     evidence: str | None = None
     confidence: float | None = Field(default=None, ge=0, le=1)
 
@@ -52,6 +53,7 @@ class AgentStepTrace(StrictModel):
 
 class AgentResult(StrictModel):
     answer: str | None = None
+    structured_data: dict[str, str | None] | None = None
     source_url: str | None = None
     evidence: str | None = None
     confidence: float | None = None

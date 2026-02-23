@@ -1,0 +1,132 @@
+[
+  {
+    "id": "example_domain_heading",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google to open example.com and report the main heading text.",
+    "expected_contains": ["Example Domain"]
+  },
+  {
+    "id": "iana_reserved_domains_title",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google to open the IANA reserved domains page (iana.org/domains/reserved) and report the page title.",
+    "expected_contains": ["IANA-managed Reserved Domains"]
+  },
+  {
+    "id": "wiki_star_wars_title",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google to open the Wikipedia article for Star Wars (film) and report the article title.",
+    "expected_contains": ["Star Wars (film)"]
+  },
+  {
+    "id": "wiki_python_title",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google to open the Wikipedia article for Python (programming language) and report the article title.",
+    "expected_contains": ["Python (programming language)"]
+  },
+  {
+    "id": "wiki_linux_title",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google to open the Wikipedia article for Linux and report the article title.",
+    "expected_contains": ["Linux"]
+  },
+  {
+    "id": "wiki_openai_title",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google to open the Wikipedia article for OpenAI and report the article title.",
+    "expected_contains": ["OpenAI"]
+  },
+  {
+    "id": "wiki_tim_berners_lee_title",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google to open the Wikipedia article for Tim Berners-Lee and report the article title.",
+    "expected_contains": ["Tim Berners-Lee"]
+  },
+  {
+    "id": "wiki_eiffel_tower_title",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google to open the Wikipedia article for Eiffel Tower and report the article title.",
+    "expected_contains": ["Eiffel Tower"]
+  },
+  {
+    "id": "wiki_moon_landing_title",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google to open the Wikipedia article for Moon landing and report the article title.",
+    "expected_contains": ["Moon landing"]
+  },
+  {
+    "id": "wiki_nasa_title",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google to open the Wikipedia article for NASA and report the article title.",
+    "expected_contains": ["NASA"]
+  },
+  {
+    "id": "wiki_united_nations_title",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google to open the Wikipedia article for United Nations and report the article title.",
+    "expected_contains": ["United Nations"]
+  },
+  {
+    "id": "wiki_mount_everest_title",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google to open the Wikipedia article for Mount Everest and report the article title.",
+    "expected_contains": ["Mount Everest"]
+  },
+  {
+    "id": "wiki_pacific_ocean_title",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google to open the Wikipedia article for Pacific Ocean and report the article title.",
+    "expected_contains": ["Pacific Ocean"]
+  },
+  {
+    "id": "wiki_periodic_table_title",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google to open the Wikipedia article for Periodic table and report the article title.",
+    "expected_contains": ["Periodic table"]
+  },
+  {
+    "id": "wiki_dna_title",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google to open the Wikipedia article for DNA and report the article title.",
+    "expected_contains": ["DNA"]
+  },
+  {
+    "id": "wiki_java_title",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google to open the Wikipedia article for Java (programming language) and report the article title.",
+    "expected_contains": ["Java (programming language)"]
+  },
+  {
+    "id": "wiki_c_title",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google to open the Wikipedia article for C (programming language) and report the article title.",
+    "expected_contains": ["C (programming language)"]
+  },
+  {
+    "id": "wiki_ada_lovelace_title",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google to open the Wikipedia article for Ada Lovelace and report the article title.",
+    "expected_contains": ["Ada Lovelace"]
+  },
+  {
+    "id": "star_wars_infobox_schema",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google to open the Wikipedia page for Star Wars (film), then extract release_date and director from the infobox.",
+    "extraction_schema": {
+      "release_date": "The theatrical release date",
+      "director": "The director name"
+    },
+    "extraction_selector": "css=table.infobox",
+    "expected_contains": ["May 25, 1977", "George Lucas"]
+  },
+  {
+    "id": "python_infobox_schema",
+    "start_url": "https://www.google.com",
+    "target_prompt": "Use Google to open the Wikipedia page for Python (programming language), then extract designer and first_appeared from the infobox.",
+    "extraction_schema": {
+      "designer": "Primary language designer",
+      "first_appeared": "Year first appeared"
+    },
+    "extraction_selector": "css=table.infobox",
+    "expected_contains": ["Guido van Rossum", "1991"]
+  }
+]

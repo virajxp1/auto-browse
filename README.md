@@ -5,8 +5,8 @@ Minimal constrained browser agent:
 1. Load page with Playwright.
 2. Convert HTML to readable markdown (readability + markdownify).
 3. Orchestrate the loop as a LangGraph state machine.
-4. Ask an LLM for exactly one tool call each turn.
-5. Execute that tool with LangGraph `ToolNode` (`extract_answer`, `type_and_submit`, `click`, `navigate`, `fail`).
+4. Ask an LLM for one or more tool calls each turn (configurable budget).
+5. Execute those tools with a LangGraph tool-execution node (`extract_answer`, `type_and_submit`, `click`, `navigate`, `fail`).
 6. Repeat until answer or failure.
 
 At every step, the API logs:
@@ -53,7 +53,8 @@ curl -X POST "http://127.0.0.1:8000/run" \
   -d '{
     "start_url": "https://www.google.com",
     "target_prompt": "release date of Star Wars",
-    "max_steps": 10
+    "max_steps": 10,
+    "max_actions_per_step": 2
   }'
 ```
 
@@ -62,6 +63,10 @@ Notes:
 - The API uses env credentials/model only (`OPENROUTER_API_KEY`, `OPENROUTER_MODEL`).
 - `start_url` accepts either a full URL (`https://...`) or a hostname (`www.google.com`), which is auto-normalized to `https://...`.
 - The API always logs intermediary step summaries and next actions.
+- `max_actions_per_step` controls how many tool calls the model may emit in one turn (`1..4`).
+- Optional schema extraction:
+  - `extraction_schema`: `{ "field_name": "field description" }`
+  - `extraction_selector`: optional Playwright selector to scope extraction to a DOM subtree.
 - Each run sends OpenRouter tracing metadata on every LLM step:
   - `trace.trace_id` is generated automatically (UUIDv7 fallback to UUID4).
   - `trace.generation_name` is set per step as `planner.1`, `planner.2`, ...
@@ -85,13 +90,6 @@ Required env vars:
 
 - `OPENROUTER_API_KEY`
 - `OPENROUTER_MODEL`
-
-Optional runtime env vars:
-
-- `PORT` (provided by Render automatically)
-- `AUTO_BROWSE_API_HOST` (default `0.0.0.0`)
-- `AUTO_BROWSE_API_PORT` (default `8000` if `PORT` is not set)
-- `AUTO_BROWSE_INSTALL_PLAYWRIGHT=1` (installs Chromium at startup)
 
 ## Use In Other Projects
 
@@ -122,6 +120,7 @@ async def main() -> None:
         start_url="https://www.google.com",
         target_prompt="release date of Star Wars",
         max_steps=10,
+        max_actions_per_step=2,
         headless=True,
     )
     print(result.model_dump())
@@ -135,6 +134,7 @@ asyncio.run(main())
 The `/run` response body contains:
 
 - `answer`
+- `structured_data` (present when schema extraction is used)
 - `source_url`
 - `evidence`
 - `confidence`
@@ -146,43 +146,70 @@ The `/run` response body contains:
 python -m unittest discover -s tests -p "test_*.py"
 ```
 
+## Evals
+
+Run repeated benchmark evals with per-task metrics:
+
+```bash
+python scripts/run_eval.py --tasks evals/tasks.json --repeats 5 --output .context/eval_report.json
+```
+
+Run the complex workflow suite (multi-step + required action assertions):
+
+```bash
+python scripts/run_eval.py --tasks evals/tasks_complex.json --repeats 3 --output .context/eval_report_complex.json
+```
+
+Options:
+
+- `--limit N` to run only the first `N` tasks.
+- `--headed` to run with a visible browser.
+- `--api-base-url http://127.0.0.1:8000` to run evals through the running API server.
+
+Task schema supports optional behavior assertions:
+
+- `min_trace_steps`: minimum required action count in the resulting trace.
+- `required_actions`: list of required actions that must appear in the trace.
+
 ## Documented Successes and Failures (Observed)
 
-The following results were observed in local API eval runs on **February 21, 2026**.
+The following results were observed in API eval runs on **February 23, 2026**.
 They are run logs from this repo's current implementation, not permanent guarantees.
 
-### Successes
+### Complex Suite (`evals/tasks_complex.json`, Google-start)
 
-- Baseline expected-success matrix: **8/8 passed** (all HTTP `200`).
-  - Examples:
-    - Wikipedia extraction: Star Wars theatrical release date -> `May 25, 1977`
-    - Example -> navigate -> IANA title extraction -> `IANA-managed Reserved Domains`
-    - DuckDuckGo search flow -> OpenAI docs title extraction -> `OpenAI API Platform Documentation`
-    - IMDb moviemeter top title extraction -> `Wuthering Heights` (as observed during run)
-- Multi-step complexity demonstrated:
-  - The most complex passing case in this set was DuckDuckGo -> docs extraction with:
-    - `6` steps
-    - `4` unique tool actions (`type_and_submit`, `click`, `navigate`, `extract`)
+- Full run report: `.context/eval_report_google_start_complex_api_full.json`
+- Result: **8/10 passed** (`80%` success, `repeats=1`, API mode).
+- Step behavior in successful runs:
+  - `median_steps_success = 2`
+  - Multi-step examples include `type_and_submit + click + extract` and `navigate + extract`.
+- Successful examples:
+  - `ddg_search_openai_docs_title` -> `type_and_submit + click + extract` -> `OpenAI API Platform Documentation`
+  - `ddg_search_python_wiki_title` -> `type_and_submit + click + extract` -> `Python (programming language)`
+  - `navigate_then_schema_star_wars` -> `navigate + extract` with structured infobox fields
+  - `schema_python_infobox` -> structured extraction (`designer`, `first_appeared`)
+- Failures in this run:
+  - `example_click_to_iana_title` -> `click_failed`
+  - `wikipedia_search_un_title` -> `max_steps_exceeded` after repeated navigation/click attempts
 
-### Failures
+### Fresh-State Fix Sanity Slice (first 5 complex tasks)
 
-- Before the MVP action-outcome verifier change, mixed evals included expected reliability misses:
-  - BooksToScrape "find cheapest Travel book" -> failed (`422`, insufficient extraction/comparison evidence)
-  - GitHub Trending "first repo" -> failed (`422`, `click_failed`)
-- In an earlier 7-test matrix, result was **6/7 passed** with the same BooksToScrape cheapest-book task failing.
-- In a separate mixed 6-test matrix, result was **4/6 passed** (main failures were GitHub Trending click reliability and BooksToScrape comparison extraction).
+- Report: `.context/eval_report_google_start_complex_limit5_after_fresh_state_fix.json`
+- Result: **4/5 passed** (`80%` success, API mode).
+- Shows stable passes on:
+  - direct navigation tasks
+  - Google search + click workflows
+- Remaining miss in this slice:
+  - `example_click_to_iana_title` (still unreliable on click-driven transition)
 
-### What improved
+### What This Means
 
-- Added MVP action-outcome verification for `click`, `type_and_submit`, and `navigate`.
-- Post-change test suite status:
-  - `tests/test_star_wars_example.py`: `8` passed
-  - full suite: `32` passed
-- Post-change expected-success eval matrix improved to **8/8 passed**.
+- The agent now handles substantially more multi-step tasks than earlier runs, including search-driven flows.
+- The remaining primary gap is robust click-driven progression on some pages, which is the highest-value next reliability target.
 
 ## Notes
 
 - This MVP intentionally constrains the action space to reduce hallucinated browser operations.
-- Orchestration is implemented with LangGraph and native tool-calling (`ToolNode`) instead of a manual `for` loop.
+- Orchestration is implemented with LangGraph state nodes instead of a manual `for` loop.
 - The LLM makes navigation decisions directly; the runtime does not auto-rewrite actions.
 - Use a Python version within the configured range (`>=3.11,<3.15`).
