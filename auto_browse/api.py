@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from agent.models import AgentResult, AgentStepTrace
 from agent.openrouter_client import OpenRouterClient
 from agent.run import run_agent
+from auto_browse.security import ApiSecurityMiddleware, SecuritySettings
 
 # Use uvicorn's error logger so step logs show up in normal server output.
 logger = logging.getLogger("uvicorn.error")
@@ -82,8 +83,10 @@ def _client_from_env() -> OpenRouterClient:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-def create_app() -> FastAPI:
+def create_app(security: SecuritySettings | None = None) -> FastAPI:
     app = FastAPI(title="auto-browse API", version="0.1.0")
+    security_settings = security or SecuritySettings.from_env()
+    app.add_middleware(ApiSecurityMiddleware, settings=security_settings)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -160,6 +163,3 @@ def create_app() -> FastAPI:
         return result
 
     return app
-
-
-app = create_app()

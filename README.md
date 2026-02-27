@@ -28,6 +28,7 @@ At every step, the API logs:
    cp .env.example .env
    export OPENROUTER_API_KEY=...
    export OPENROUTER_MODEL=openai/gpt-4.1-mini
+   export AUTO_BROWSE_API_TOKEN=replace-with-shared-token
    ```
    The runtime also auto-loads these keys from a local `.env` file if present.
 
@@ -42,13 +43,14 @@ Start the server:
 or run `uvicorn` directly:
 
 ```bash
-python -m uvicorn auto_browse.api:app --host 127.0.0.1 --port 8000
+python -m uvicorn auto_browse.api:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
 Call it:
 
 ```bash
 curl -X POST "http://127.0.0.1:8000/run" \
+  -H "X-API-Token: replace-with-shared-token" \
   -H "Content-Type: application/json" \
   -d '{
     "start_url": "https://www.google.com",
@@ -61,6 +63,17 @@ curl -X POST "http://127.0.0.1:8000/run" \
 Notes:
 
 - The API uses env credentials/model only (`OPENROUTER_API_KEY`, `OPENROUTER_MODEL`).
+- Startup requires `AUTO_BROWSE_API_TOKEN` (recommended in `.env`).
+- Every request must include the shared token header (`X-API-Token`) matching `AUTO_BROWSE_API_TOKEN`.
+- Built-in middleware adds basic DDoS controls configured in `config/security.toml`:
+  - `max_request_body_bytes` (default `65536`)
+  - `rate_limit_max_requests` per `rate_limit_window_seconds` (defaults `30` per `60s`)
+  - `max_concurrent_requests_per_ip` (default `4`)
+  - `api_token_header` (default `x-api-token`)
+- `X-Forwarded-For` is ignored by default. To trust it behind a known proxy, set:
+  - `trust_x_forwarded_for = true`
+  - `trusted_proxy_cidrs = ["<proxy-cidr>"]`
+- `AUTO_BROWSE_SECURITY_CONFIG_PATH` can point to a different config file path if needed.
 - `start_url` accepts either a full URL (`https://...`) or a hostname (`www.google.com`), which is auto-normalized to `https://...`.
 - The API always logs intermediary step summaries and next actions.
 - `max_actions_per_step` controls how many tool calls the model may emit in one turn (`1..4`).
@@ -90,6 +103,7 @@ Required env vars:
 
 - `OPENROUTER_API_KEY`
 - `OPENROUTER_MODEL`
+- `AUTO_BROWSE_API_TOKEN`
 
 ## Use In Other Projects
 
