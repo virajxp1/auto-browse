@@ -6,7 +6,29 @@ from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 
 from agent.models import AgentResult
-from auto_browse.api import app
+from auto_browse.api import create_app
+from auto_browse.security import DEFAULT_API_TOKEN_HEADER, SecuritySettings
+
+TEST_SHARED_API_TOKEN = "test-shared-token"
+
+
+def _client() -> TestClient:
+    return TestClient(
+        create_app(
+            security=SecuritySettings(
+                api_token=TEST_SHARED_API_TOKEN,
+                api_token_header=DEFAULT_API_TOKEN_HEADER,
+                rate_limit_max_requests=1000,
+                rate_limit_window_seconds=60,
+                max_concurrent_requests_per_ip=100,
+                max_request_body_bytes=64 * 1024,
+            )
+        )
+    )
+
+
+def _auth_headers() -> dict[str, str]:
+    return {DEFAULT_API_TOKEN_HEADER: TEST_SHARED_API_TOKEN}
 
 
 class ApiStatusMappingTest(unittest.TestCase):
@@ -18,9 +40,10 @@ class ApiStatusMappingTest(unittest.TestCase):
                 new=AsyncMock(return_value=AgentResult(error="max_steps_exceeded", trace=[])),
             ),
         ):
-            client = TestClient(app)
+            client = _client()
             response = client.post(
                 "/run",
+                headers=_auth_headers(),
                 json={
                     "start_url": "https://example.com",
                     "target_prompt": "test",
@@ -48,9 +71,10 @@ class ApiStatusMappingTest(unittest.TestCase):
                 ),
             ),
         ):
-            client = TestClient(app)
+            client = _client()
             response = client.post(
                 "/run",
+                headers=_auth_headers(),
                 json={
                     "start_url": "https://example.com",
                     "target_prompt": "test",

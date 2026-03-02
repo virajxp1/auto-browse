@@ -7,10 +7,99 @@ from fastapi.testclient import TestClient
 from playwright.async_api import Error as PlaywrightError
 
 from agent.models import AgentResult
-from auto_browse.api import app
+from auto_browse.api import create_app
+from auto_browse.security import DEFAULT_API_TOKEN_HEADER, SecuritySettings
+
+TEST_SHARED_API_TOKEN = "test-shared-token"
+
+
+def _build_client(
+    *,
+    rate_limit_max_requests: int = 1000,
+    rate_limit_window_seconds: int = 60,
+    max_concurrent_requests_per_ip: int = 100,
+    max_request_body_bytes: int = 64 * 1024,
+) -> TestClient:
+    return TestClient(
+        create_app(
+            security=SecuritySettings(
+                api_token=TEST_SHARED_API_TOKEN,
+                api_token_header=DEFAULT_API_TOKEN_HEADER,
+                rate_limit_max_requests=rate_limit_max_requests,
+                rate_limit_window_seconds=rate_limit_window_seconds,
+                max_concurrent_requests_per_ip=max_concurrent_requests_per_ip,
+                max_request_body_bytes=max_request_body_bytes,
+            )
+        )
+    )
+
+
+def _auth_headers(token: str = TEST_SHARED_API_TOKEN) -> dict[str, str]:
+    return {DEFAULT_API_TOKEN_HEADER: token}
+
+
+def _run_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "start_url": "https://example.com",
+        "target_prompt": "release date",
+    }
+    payload.update(overrides)
+    return payload
 
 
 class ApiTest(unittest.TestCase):
+    def test_run_rejects_requests_without_api_token_header(self) -> None:
+        with patch("auto_browse.api.run_agent", new=AsyncMock()) as mock_run_agent:
+            response = _build_client().post("/run", json=_run_payload())
+
+        self.assertEqual(response.status_code, 401)
+        self.assertIn("Missing or invalid API token", response.json()["detail"])
+        mock_run_agent.assert_not_awaited()
+
+    def test_run_rejects_requests_with_wrong_api_token(self) -> None:
+        with patch("auto_browse.api.run_agent", new=AsyncMock()) as mock_run_agent:
+            response = _build_client().post(
+                "/run",
+                headers=_auth_headers(token="wrong-token"),
+                json=_run_payload(),
+            )
+
+        self.assertEqual(response.status_code, 401)
+        mock_run_agent.assert_not_awaited()
+
+    def test_run_applies_rate_limit_before_route_logic(self) -> None:
+        client = _build_client(rate_limit_max_requests=1, rate_limit_window_seconds=60)
+        first = client.get("/health", headers=_auth_headers())
+        second = client.get("/health", headers=_auth_headers())
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 429)
+        self.assertEqual(second.headers.get("Retry-After"), "60")
+
+    def test_run_rejects_request_body_that_is_too_large(self) -> None:
+        with patch("auto_browse.api.run_agent", new=AsyncMock()) as mock_run_agent:
+            response = _build_client(max_request_body_bytes=10).post(
+                "/run",
+                headers=_auth_headers(),
+                json=_run_payload(),
+            )
+
+        self.assertEqual(response.status_code, 413)
+        self.assertIn("Request body too large", response.json()["detail"])
+        mock_run_agent.assert_not_awaited()
+
+    def test_run_rejects_oversized_body_even_with_small_content_length_header(self) -> None:
+        with patch("auto_browse.api.run_agent", new=AsyncMock()) as mock_run_agent:
+            response = _build_client(max_request_body_bytes=10).post(
+                "/run",
+                headers={**_auth_headers(), "content-length": "1"},
+                content=b"{" + b"a" * 200,
+            )
+
+        self.assertEqual(response.status_code, 413)
+        self.assertIn("Request body too large", response.json()["detail"])
+        mock_run_agent.assert_not_awaited()
+
     def test_run_uses_env_client(self) -> None:
         with (
             patch("auto_browse.api.OpenRouterClient.from_env", return_value=object()) as mock_from_env,
@@ -27,13 +116,7 @@ class ApiTest(unittest.TestCase):
                 ),
             ) as mock_run_agent,
         ):
-            response = TestClient(app).post(
-                "/run",
-                json={
-                    "start_url": "https://example.com",
-                    "target_prompt": "release date",
-                },
-            )
+            response = _build_client().post("/run", headers=_auth_headers(), json=_run_payload())
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["answer"], "May 25, 1977")
@@ -43,61 +126,46 @@ class ApiTest(unittest.TestCase):
         self.assertIsInstance(mock_run_agent.await_args.kwargs["trace_id"], str)
 
     def test_run_rejects_request_level_api_key(self) -> None:
-        response = TestClient(app).post(
+        response = _build_client().post(
             "/run",
-            json={
-                "start_url": "https://example.com",
-                "target_prompt": "release date",
-                "api_key": "abc",
-            },
+            headers=_auth_headers(),
+            json=_run_payload(api_key="abc"),
         )
 
         self.assertEqual(response.status_code, 422)
 
     def test_run_rejects_request_level_model_name(self) -> None:
-        response = TestClient(app).post(
+        response = _build_client().post(
             "/run",
-            json={
-                "start_url": "https://example.com",
-                "target_prompt": "release date",
-                "model_name": "openai/gpt-4.1-mini",
-            },
+            headers=_auth_headers(),
+            json=_run_payload(model_name="openai/gpt-4.1-mini"),
         )
 
         self.assertEqual(response.status_code, 422)
 
     def test_run_rejects_request_level_log_steps(self) -> None:
-        response = TestClient(app).post(
+        response = _build_client().post(
             "/run",
-            json={
-                "start_url": "https://example.com",
-                "target_prompt": "release date",
-                "log_steps": False,
-            },
+            headers=_auth_headers(),
+            json=_run_payload(log_steps=False),
         )
 
         self.assertEqual(response.status_code, 422)
 
     def test_run_rejects_request_level_trace_id(self) -> None:
-        response = TestClient(app).post(
+        response = _build_client().post(
             "/run",
-            json={
-                "start_url": "https://example.com",
-                "target_prompt": "release date",
-                "trace_id": "trace-123",
-            },
+            headers=_auth_headers(),
+            json=_run_payload(trace_id="trace-123"),
         )
 
         self.assertEqual(response.status_code, 422)
 
     def test_run_rejects_request_level_session_id(self) -> None:
-        response = TestClient(app).post(
+        response = _build_client().post(
             "/run",
-            json={
-                "start_url": "https://example.com",
-                "target_prompt": "release date",
-                "session_id": "session-456",
-            },
+            headers=_auth_headers(),
+            json=_run_payload(session_id="session-456"),
         )
 
         self.assertEqual(response.status_code, 422)
@@ -118,8 +186,9 @@ class ApiTest(unittest.TestCase):
                 ),
             ) as mock_run_agent,
         ):
-            response = TestClient(app).post(
+            response = _build_client().post(
                 "/run",
+                headers=_auth_headers(),
                 json={
                     "start_url": "www.google.com",
                     "target_prompt": "release date of Star Wars",
@@ -137,13 +206,7 @@ class ApiTest(unittest.TestCase):
                 new=AsyncMock(side_effect=PlaywrightError("Cannot navigate to invalid URL")),
             ),
         ):
-            response = TestClient(app).post(
-                "/run",
-                json={
-                    "start_url": "https://example.com",
-                    "target_prompt": "release date",
-                },
-            )
+            response = _build_client().post("/run", headers=_auth_headers(), json=_run_payload())
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("Browser navigation failed", response.json()["detail"])
@@ -164,13 +227,7 @@ class ApiTest(unittest.TestCase):
                 ),
             ) as mock_run_agent,
         ):
-            response = TestClient(app).post(
-                "/run",
-                json={
-                    "start_url": "https://example.com",
-                    "target_prompt": "release date",
-                },
-            )
+            response = _build_client().post("/run", headers=_auth_headers(), json=_run_payload())
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(callable(mock_run_agent.await_args.kwargs["on_step"]))
@@ -192,13 +249,7 @@ class ApiTest(unittest.TestCase):
                 ),
             ) as mock_run_agent,
         ):
-            response = TestClient(app).post(
-                "/run",
-                json={
-                    "start_url": "https://example.com",
-                    "target_prompt": "release date",
-                },
-            )
+            response = _build_client().post("/run", headers=_auth_headers(), json=_run_payload())
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(mock_run_agent.await_args.kwargs["trace_id"], "trace-generated")
@@ -223,8 +274,9 @@ class ApiTest(unittest.TestCase):
                 ),
             ) as mock_run_agent,
         ):
-            response = TestClient(app).post(
+            response = _build_client().post(
                 "/run",
+                headers=_auth_headers(),
                 json={
                     "start_url": "https://example.com",
                     "target_prompt": "Extract release date and director",

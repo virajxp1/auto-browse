@@ -1,0 +1,8 @@
+[security]
+api_token_header = "x-api-token"
+rate_limit_max_requests = 30
+rate_limit_window_seconds = 60
+max_concurrent_requests_per_ip = 4
+max_request_body_bytes = 65536
+trust_x_forwarded_for = false
+trusted_proxy_cidrs = []

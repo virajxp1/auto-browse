@@ -23,7 +23,7 @@ if [[ "${AUTO_BROWSE_INSTALL_PLAYWRIGHT:-0}" == "1" ]]; then
 fi
 
 if [[ "${AUTO_BROWSE_API_RELOAD:-0}" == "1" ]]; then
-  exec "$PYTHON_BIN" -m uvicorn auto_browse.api:app --host "${HOST}" --port "${PORT}" --log-level "${LOG_LEVEL}" --reload
+  exec "$PYTHON_BIN" -m uvicorn auto_browse.api:create_app --factory --host "${HOST}" --port "${PORT}" --log-level "${LOG_LEVEL}" --reload
 fi
 
-exec "$PYTHON_BIN" -m uvicorn auto_browse.api:app --host "${HOST}" --port "${PORT}" --log-level "${LOG_LEVEL}"
+exec "$PYTHON_BIN" -m uvicorn auto_browse.api:create_app --factory --host "${HOST}" --port "${PORT}" --log-level "${LOG_LEVEL}"
