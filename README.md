@@ -227,3 +227,7 @@ They are run logs from this repo's current implementation, not permanent guarant
 - Orchestration is implemented with LangGraph state nodes instead of a manual `for` loop.
 - The LLM makes navigation decisions directly; the runtime does not auto-rewrite actions.
 - Use a Python version within the configured range (`>=3.11,<3.15`).
+
+## License
+
+This project is licensed under the MIT License. See the [`LICENSE`](LICENSE) file.
