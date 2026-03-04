@@ -309,6 +309,7 @@ class ApiTest(unittest.TestCase):
 
     def test_run_maps_unexpected_run_agent_error_to_500_and_logs_exception(self) -> None:
         with (
+            patch("auto_browse.api._RunCooldownLimiter.try_acquire", return_value=(True, 0)),
             patch("auto_browse.api.OpenRouterClient.from_env", return_value=object()),
             patch("auto_browse.api.logger.exception") as mock_logger_exception,
             patch(
