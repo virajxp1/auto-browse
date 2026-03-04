@@ -27,10 +27,14 @@ At every step, the API logs:
    ```bash
    cp .env.example .env
    export OPENROUTER_API_KEY=...
-   export OPENROUTER_MODEL=openai/gpt-4.1-mini
    export AUTO_BROWSE_API_TOKEN=replace-with-shared-token
    ```
    The runtime also auto-loads these keys from a local `.env` file if present.
+3. Set the model in `config/config.ini`:
+   ```ini
+   [openrouter]
+   model = openai/gpt-4.1-mini
+   ```
 
 ## Run As API
 
@@ -62,9 +66,10 @@ curl -X POST "http://127.0.0.1:8000/run" \
 
 Notes:
 
-- The API uses env credentials/model only (`OPENROUTER_API_KEY`, `OPENROUTER_MODEL`).
+- The API reads OpenRouter credentials from env (`OPENROUTER_API_KEY`) and model from `config/config.ini`.
 - Startup requires `AUTO_BROWSE_API_TOKEN` (recommended in `.env`).
 - Every request must include the shared token header (`X-API-Token`) matching `AUTO_BROWSE_API_TOKEN`.
+- `AUTO_BROWSE_OPENROUTER_CONFIG_PATH` can point to a different INI config path if needed.
 - Built-in middleware adds basic DDoS controls configured in `config/security.toml`:
   - `max_request_body_bytes` (default `65536`)
   - `rate_limit_max_requests` per `rate_limit_window_seconds` (defaults `30` per `60s`)
@@ -102,8 +107,11 @@ Start command:
 Required env vars:
 
 - `OPENROUTER_API_KEY`
-- `OPENROUTER_MODEL`
 - `AUTO_BROWSE_API_TOKEN`
+
+Required config file setting:
+
+- `config/config.ini` -> `[openrouter] model = ...`
 
 ## Use In Other Projects
 
