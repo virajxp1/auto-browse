@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: auto-browse-api
+    env: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_MODEL
+        value: openai/gpt-4.1-mini
+      - key: AUTO_BROWSE_API_TOKEN
+        generateValue: true

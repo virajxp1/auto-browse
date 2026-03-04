@@ -85,25 +85,26 @@ Notes:
   - `trace.generation_name` is set per step as `planner.1`, `planner.2`, ...
   - `session_id` is generated internally to match `trace_id`.
 
-## Deploy (Render Example)
+## Deploy (Render)
 
-Build command:
+This repo includes a Render Blueprint at [`render.yaml`](render.yaml) and a Playwright-ready [`Dockerfile`](Dockerfile).
 
-```bash
-pip install -e . && playwright install chromium
-```
+Steps:
 
-Start command:
+1. Push this repo to GitHub.
+2. In Render, create a new Blueprint service from the repo.
+3. Set `OPENROUTER_API_KEY` in the Render dashboard before first deploy.
+4. Deploy.
 
-```bash
-./scripts/run_api.sh
-```
+Render setup details:
 
-Required env vars:
-
-- `OPENROUTER_API_KEY`
-- `OPENROUTER_MODEL`
-- `AUTO_BROWSE_API_TOKEN`
+- Runtime: Docker (`Dockerfile`)
+- Start command: `./scripts/run_api.sh` (from container `CMD`)
+- Health endpoint: `/health`
+- Configured env vars:
+  - `OPENROUTER_API_KEY` (secret, required)
+  - `OPENROUTER_MODEL` (default `openai/gpt-4.1-mini`)
+  - `AUTO_BROWSE_API_TOKEN` (auto-generated in `render.yaml`)
 
 ## Use In Other Projects
 
