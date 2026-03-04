@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -69,16 +70,20 @@ class ApiTest(unittest.TestCase):
 
     def test_run_rejects_when_another_run_is_in_progress(self) -> None:
         with (
-            patch(
-                "auto_browse.api._RunConcurrencyGate.try_acquire",
-                new=AsyncMock(return_value=False),
-            ),
+            patch("auto_browse.api._RunConcurrencyGate.try_acquire", return_value=False),
+            patch("auto_browse.api.logger.warning") as mock_logger_warning,
             patch("auto_browse.api.run_agent", new=AsyncMock()) as mock_run_agent,
         ):
             response = _build_client().post("/run", headers=_auth_headers(), json=_run_payload())
 
         self.assertEqual(response.status_code, 429)
         self.assertIn("already in progress", response.json()["detail"])
+        blocked_logs = [
+            call
+            for call in mock_logger_warning.call_args_list
+            if call.args and call.args[0] == "[run:%s trace:%s] blocked_by_gate active_runs=%s max_active_runs=%s"
+        ]
+        self.assertEqual(len(blocked_logs), 1)
         mock_run_agent.assert_not_awaited()
 
     def test_run_logs_input_and_output_payloads(self) -> None:
@@ -282,6 +287,62 @@ class ApiTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("Browser navigation failed", response.json()["detail"])
+
+    def test_run_releases_gate_after_value_error(self) -> None:
+        with (
+            patch("auto_browse.api.OpenRouterClient.from_env", return_value=object()),
+            patch(
+                "auto_browse.api.run_agent",
+                new=AsyncMock(
+                    side_effect=[
+                        ValueError("bad input"),
+                        AgentResult(
+                            answer="ok",
+                            source_url="https://example.com",
+                            evidence="ok",
+                            confidence=0.8,
+                            trace=[],
+                        ),
+                    ]
+                ),
+            ),
+        ):
+            client = _build_client()
+            first_response = client.post("/run", headers=_auth_headers(), json=_run_payload())
+            second_response = client.post("/run", headers=_auth_headers(), json=_run_payload())
+
+        self.assertEqual(first_response.status_code, 400)
+        self.assertEqual(first_response.json()["detail"], "bad input")
+        self.assertEqual(second_response.status_code, 200)
+        self.assertEqual(second_response.json()["answer"], "ok")
+
+    def test_run_releases_gate_after_timeout_error(self) -> None:
+        with (
+            patch("auto_browse.api.OpenRouterClient.from_env", return_value=object()),
+            patch(
+                "auto_browse.api.run_agent",
+                new=AsyncMock(
+                    side_effect=[
+                        asyncio.TimeoutError(),
+                        AgentResult(
+                            answer="ok",
+                            source_url="https://example.com",
+                            evidence="ok",
+                            confidence=0.8,
+                            trace=[],
+                        ),
+                    ]
+                ),
+            ),
+        ):
+            client = _build_client()
+            first_response = client.post("/run", headers=_auth_headers(), json=_run_payload())
+            second_response = client.post("/run", headers=_auth_headers(), json=_run_payload())
+
+        self.assertEqual(first_response.status_code, 504)
+        self.assertIn("timed out", first_response.json()["detail"])
+        self.assertEqual(second_response.status_code, 200)
+        self.assertEqual(second_response.json()["answer"], "ok")
 
     def test_run_always_sets_step_logging_callback(self) -> None:
         with (
