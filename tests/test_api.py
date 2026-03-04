@@ -67,6 +67,78 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
         mock_run_agent.assert_not_awaited()
 
+    def test_run_rejects_when_another_run_is_in_progress(self) -> None:
+        with (
+            patch(
+                "auto_browse.api._RunConcurrencyGate.try_acquire",
+                new=AsyncMock(return_value=False),
+            ),
+            patch("auto_browse.api.run_agent", new=AsyncMock()) as mock_run_agent,
+        ):
+            response = _build_client().post("/run", headers=_auth_headers(), json=_run_payload())
+
+        self.assertEqual(response.status_code, 429)
+        self.assertIn("already in progress", response.json()["detail"])
+        mock_run_agent.assert_not_awaited()
+
+    def test_run_logs_input_and_output_payloads(self) -> None:
+        with (
+            patch("auto_browse.api.OpenRouterClient.from_env", return_value=object()),
+            patch("auto_browse.api.logger.info") as mock_logger_info,
+            patch(
+                "auto_browse.api.run_agent",
+                new=AsyncMock(
+                    return_value=AgentResult(
+                        answer="May 25, 1977",
+                        source_url="https://example.com",
+                        evidence="Release date May 25, 1977",
+                        confidence=0.86,
+                        trace=[],
+                    )
+                ),
+            ),
+        ):
+            response = _build_client().post("/run", headers=_auth_headers(), json=_run_payload())
+
+        self.assertEqual(response.status_code, 200)
+
+        input_logs = [
+            call
+            for call in mock_logger_info.call_args_list
+            if call.args and call.args[0] == "[run:%s trace:%s] input_payload=%s"
+        ]
+        self.assertEqual(len(input_logs), 1)
+        self.assertEqual(input_logs[0].args[3]["start_url"], "https://example.com")
+        self.assertEqual(input_logs[0].args[3]["target_prompt"], "release date")
+
+        output_logs = [
+            call
+            for call in mock_logger_info.call_args_list
+            if call.args and call.args[0] == "[run:%s trace:%s] output_payload=%s"
+        ]
+        self.assertEqual(len(output_logs), 1)
+        self.assertEqual(output_logs[0].args[3]["answer"], "May 25, 1977")
+
+    def test_middleware_logs_rejected_request(self) -> None:
+        with (
+            patch("auto_browse.security.logger.info") as mock_logger_info,
+            patch("auto_browse.api.run_agent", new=AsyncMock()) as mock_run_agent,
+        ):
+            response = _build_client().post("/run", json=_run_payload())
+
+        self.assertEqual(response.status_code, 401)
+        mock_run_agent.assert_not_awaited()
+        rejection_logs = [
+            call
+            for call in mock_logger_info.call_args_list
+            if call.args and call.args[0] == "[security] rejected method=%s path=%s client_ip=%s status=%s reason=%s detail=%s"
+        ]
+        self.assertEqual(len(rejection_logs), 1)
+        self.assertEqual(rejection_logs[0].args[1], "POST")
+        self.assertEqual(rejection_logs[0].args[2], "/run")
+        self.assertEqual(rejection_logs[0].args[4], 401)
+        self.assertEqual(rejection_logs[0].args[5], "invalid_api_token")
+
     def test_run_applies_rate_limit_before_route_logic(self) -> None:
         client = _build_client(rate_limit_max_requests=1, rate_limit_window_seconds=60)
         first = client.get("/health", headers=_auth_headers())
