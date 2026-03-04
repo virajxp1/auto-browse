@@ -33,7 +33,7 @@ At every step, the API logs:
 3. Set the model in `config/config.ini`:
    ```ini
    [openrouter]
-   model = openai/gpt-4.1-mini
+   model = gpt-oss-20b
    ```
 
 ## Run As API
