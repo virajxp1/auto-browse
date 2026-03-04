@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import uuid
 
 from fastapi import FastAPI, HTTPException
@@ -21,19 +22,23 @@ class _RunConcurrencyGate:
     def __init__(self, *, max_active_runs: int = 1) -> None:
         self._max_active_runs = max_active_runs
         self._active_runs = 0
-        self._lock = asyncio.Lock()
+        self._lock = threading.Lock()
 
-    async def try_acquire(self) -> bool:
-        async with self._lock:
+    def try_acquire(self) -> bool:
+        with self._lock:
             if self._active_runs >= self._max_active_runs:
                 return False
             self._active_runs += 1
             return True
 
-    async def release(self) -> None:
-        async with self._lock:
+    def release(self) -> None:
+        with self._lock:
             if self._active_runs > 0:
                 self._active_runs -= 1
+
+    def snapshot(self) -> tuple[int, int]:
+        with self._lock:
+            return self._active_runs, self._max_active_runs
 
 
 class RunRequest(BaseModel):
@@ -148,8 +153,16 @@ def create_app(security: SecuritySettings | None = None) -> FastAPI:
             trace_id,
             payload.model_dump(mode="json"),
         )
-        if not await run_gate.try_acquire():
+        if not run_gate.try_acquire():
+            active_runs, max_active_runs = run_gate.snapshot()
             response_payload = {"detail": "Another agent run is already in progress"}
+            logger.warning(
+                "[run:%s trace:%s] blocked_by_gate active_runs=%s max_active_runs=%s",
+                request_id,
+                trace_id,
+                active_runs,
+                max_active_runs,
+            )
             logger.info("[run:%s trace:%s] output_payload=%s", request_id, trace_id, response_payload)
             raise HTTPException(status_code=429, detail=response_payload["detail"])
 
@@ -178,6 +191,10 @@ def create_app(security: SecuritySettings | None = None) -> FastAPI:
                 response_payload = {"detail": f"Browser navigation failed: {exc}"}
                 logger.info("[run:%s trace:%s] output_payload=%s", request_id, trace_id, response_payload)
                 raise HTTPException(status_code=400, detail=response_payload["detail"]) from exc
+            except asyncio.TimeoutError as exc:
+                response_payload = {"detail": "Agent run timed out"}
+                logger.info("[run:%s trace:%s] output_payload=%s", request_id, trace_id, response_payload)
+                raise HTTPException(status_code=504, detail=response_payload["detail"]) from exc
             except ValueError as exc:
                 response_payload = {"detail": str(exc)}
                 logger.info("[run:%s trace:%s] output_payload=%s", request_id, trace_id, response_payload)
@@ -213,6 +230,6 @@ def create_app(security: SecuritySettings | None = None) -> FastAPI:
             )
             return result
         finally:
-            await run_gate.release()
+            run_gate.release()
 
     return app
