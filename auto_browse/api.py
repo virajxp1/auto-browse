@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 
@@ -14,6 +15,25 @@ from auto_browse.security import ApiSecurityMiddleware, SecuritySettings
 
 # Use uvicorn's error logger so step logs show up in normal server output.
 logger = logging.getLogger("uvicorn.error")
+
+
+class _RunConcurrencyGate:
+    def __init__(self, *, max_active_runs: int = 1) -> None:
+        self._max_active_runs = max_active_runs
+        self._active_runs = 0
+        self._lock = asyncio.Lock()
+
+    async def try_acquire(self) -> bool:
+        async with self._lock:
+            if self._active_runs >= self._max_active_runs:
+                return False
+            self._active_runs += 1
+            return True
+
+    async def release(self) -> None:
+        async with self._lock:
+            if self._active_runs > 0:
+                self._active_runs -= 1
 
 
 class RunRequest(BaseModel):
@@ -87,6 +107,7 @@ def create_app(security: SecuritySettings | None = None) -> FastAPI:
     app = FastAPI(title="auto-browse API", version="0.1.0")
     security_settings = security or SecuritySettings.from_env()
     app.add_middleware(ApiSecurityMiddleware, settings=security_settings)
+    run_gate = _RunConcurrencyGate(max_active_runs=1)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -96,7 +117,6 @@ def create_app(security: SecuritySettings | None = None) -> FastAPI:
     async def run(payload: RunRequest) -> AgentResult:
         request_id = uuid.uuid4().hex[:8]
         trace_id = _new_trace_id()
-        client = _client_from_env()
 
         def _log_step(trace_item: AgentStepTrace) -> None:
             logger.info(
@@ -122,26 +142,61 @@ def create_app(security: SecuritySettings | None = None) -> FastAPI:
             payload.max_steps,
             payload.headed,
         )
+        logger.info(
+            "[run:%s trace:%s] input_payload=%s",
+            request_id,
+            trace_id,
+            payload.model_dump(mode="json"),
+        )
+        if not await run_gate.try_acquire():
+            response_payload = {"detail": "Another agent run is already in progress"}
+            logger.info("[run:%s trace:%s] output_payload=%s", request_id, trace_id, response_payload)
+            raise HTTPException(status_code=429, detail=response_payload["detail"])
 
         try:
-            result = await run_agent(
-                client,
-                start_url=payload.start_url,
-                target_prompt=payload.target_prompt,
-                max_steps=payload.max_steps,
-                max_actions_per_step=payload.max_actions_per_step,
-                extraction_schema=payload.extraction_schema,
-                extraction_selector=payload.extraction_selector,
-                headless=not payload.headed,
-                on_step=_log_step,
-                trace_id=trace_id,
-            )
-        except PlaywrightError as exc:
-            raise HTTPException(status_code=400, detail=f"Browser navigation failed: {exc}") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            try:
+                client = _client_from_env()
+            except HTTPException as exc:
+                response_payload = {"detail": exc.detail}
+                logger.info("[run:%s trace:%s] output_payload=%s", request_id, trace_id, response_payload)
+                raise
 
-        if result.error:
+            try:
+                result = await run_agent(
+                    client,
+                    start_url=payload.start_url,
+                    target_prompt=payload.target_prompt,
+                    max_steps=payload.max_steps,
+                    max_actions_per_step=payload.max_actions_per_step,
+                    extraction_schema=payload.extraction_schema,
+                    extraction_selector=payload.extraction_selector,
+                    headless=not payload.headed,
+                    on_step=_log_step,
+                    trace_id=trace_id,
+                )
+            except PlaywrightError as exc:
+                response_payload = {"detail": f"Browser navigation failed: {exc}"}
+                logger.info("[run:%s trace:%s] output_payload=%s", request_id, trace_id, response_payload)
+                raise HTTPException(status_code=400, detail=response_payload["detail"]) from exc
+            except ValueError as exc:
+                response_payload = {"detail": str(exc)}
+                logger.info("[run:%s trace:%s] output_payload=%s", request_id, trace_id, response_payload)
+                raise HTTPException(status_code=400, detail=response_payload["detail"]) from exc
+
+            if result.error:
+                logger.info(
+                    "[run:%s trace:%s] finished error=%s answer_present=%s trace_steps=%s",
+                    request_id,
+                    trace_id,
+                    result.error,
+                    bool(result.answer),
+                    len(result.trace),
+                )
+                detail = result.model_dump()
+                response_payload = {"detail": detail}
+                logger.info("[run:%s trace:%s] output_payload=%s", request_id, trace_id, response_payload)
+                raise HTTPException(status_code=422, detail=detail)
+
             logger.info(
                 "[run:%s trace:%s] finished error=%s answer_present=%s trace_steps=%s",
                 request_id,
@@ -150,16 +205,14 @@ def create_app(security: SecuritySettings | None = None) -> FastAPI:
                 bool(result.answer),
                 len(result.trace),
             )
-            raise HTTPException(status_code=422, detail=result.model_dump())
-
-        logger.info(
-            "[run:%s trace:%s] finished error=%s answer_present=%s trace_steps=%s",
-            request_id,
-            trace_id,
-            result.error,
-            bool(result.answer),
-            len(result.trace),
-        )
-        return result
+            logger.info(
+                "[run:%s trace:%s] output_payload=%s",
+                request_id,
+                trace_id,
+                result.model_dump(mode="json"),
+            )
+            return result
+        finally:
+            await run_gate.release()
 
     return app

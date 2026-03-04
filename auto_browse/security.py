@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import logging
 import os
 import time
 import tomllib
@@ -21,6 +22,8 @@ DEFAULT_MAX_REQUEST_BODY_BYTES = 64 * 1024
 DEFAULT_SECURITY_CONFIG_PATH = "config/security.toml"
 DEFAULT_TRUST_X_FORWARDED_FOR = False
 DEFAULT_TRUSTED_PROXY_CIDRS: tuple[str, ...] = ()
+
+logger = logging.getLogger("uvicorn.error")
 
 
 def _parse_int_value(raw_value: int | str, *, name: str, minimum: int) -> int:
@@ -371,10 +374,38 @@ class ApiSecurityMiddleware:
             return
 
         request = Request(scope, receive=receive)
+        request_method = request.method
+        request_path = request.url.path
+        source_ip = _get_client_ip(request)
+
+        async def _reject(
+            *,
+            status_code: int,
+            detail: str,
+            reason: str,
+            headers: dict[str, str] | None = None,
+            client_ip: str | None = None,
+        ) -> None:
+            rejected_ip = client_ip or source_ip
+            logger.info(
+                "[security] rejected method=%s path=%s client_ip=%s status=%s reason=%s detail=%s",
+                request_method,
+                request_path,
+                rejected_ip,
+                status_code,
+                reason,
+                detail,
+            )
+            response = JSONResponse(status_code=status_code, content={"detail": detail}, headers=headers)
+            await response(scope, receive, send)
+
         provided_token = request.headers.get(self.settings.api_token_header, "")
         if provided_token != self.settings.api_token:
-            response = JSONResponse(status_code=401, content={"detail": "Missing or invalid API token"})
-            await response(scope, receive, send)
+            await _reject(
+                status_code=401,
+                detail="Missing or invalid API token",
+                reason="invalid_api_token",
+            )
             return
 
         content_length_header = request.headers.get("content-length")
@@ -382,13 +413,19 @@ class ApiSecurityMiddleware:
             try:
                 content_length = int(content_length_header)
             except ValueError:
-                response = JSONResponse(status_code=400, content={"detail": "Invalid Content-Length header"})
-                await response(scope, receive, send)
+                await _reject(
+                    status_code=400,
+                    detail="Invalid Content-Length header",
+                    reason="invalid_content_length",
+                )
                 return
 
             if content_length > self.settings.max_request_body_bytes:
-                response = JSONResponse(status_code=413, content={"detail": "Request body too large"})
-                await response(scope, receive, send)
+                await _reject(
+                    status_code=413,
+                    detail="Request body too large",
+                    reason="content_length_too_large",
+                )
                 return
 
         client_ip = _resolve_rate_limit_ip(request, self.settings)
@@ -401,18 +438,23 @@ class ApiSecurityMiddleware:
                 recent_requests.popleft()
 
             if len(recent_requests) >= self.settings.rate_limit_max_requests:
-                response = JSONResponse(
+                await _reject(
                     status_code=429,
-                    content={"detail": "Rate limit exceeded"},
+                    detail="Rate limit exceeded",
+                    reason="rate_limit_exceeded",
                     headers={"Retry-After": str(self.settings.rate_limit_window_seconds)},
+                    client_ip=client_ip,
                 )
-                await response(scope, receive, send)
                 return
 
             current_in_flight = self._in_flight_requests_by_ip.get(client_ip, 0)
             if current_in_flight >= self.settings.max_concurrent_requests_per_ip:
-                response = JSONResponse(status_code=429, content={"detail": "Too many concurrent requests"})
-                await response(scope, receive, send)
+                await _reject(
+                    status_code=429,
+                    detail="Too many concurrent requests",
+                    reason="concurrency_limit_exceeded",
+                    client_ip=client_ip,
+                )
                 return
 
             recent_requests.append(now)
@@ -421,8 +463,12 @@ class ApiSecurityMiddleware:
         try:
             buffered_body_messages, body_too_large = await self._buffer_request_body(receive)
             if body_too_large:
-                response = JSONResponse(status_code=413, content={"detail": "Request body too large"})
-                await response(scope, receive, send)
+                await _reject(
+                    status_code=413,
+                    detail="Request body too large",
+                    reason="buffered_body_too_large",
+                    client_ip=client_ip,
+                )
                 return
 
             message_index = 0
