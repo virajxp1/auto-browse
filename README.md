@@ -85,25 +85,44 @@ Notes:
   - `trace.generation_name` is set per step as `planner.1`, `planner.2`, ...
   - `session_id` is generated internally to match `trace_id`.
 
-## Deploy (Render Example)
+## Deploy (Render)
 
-Build command:
+Deploy this repo as a standard Render **Web Service** using the included [`Dockerfile`](Dockerfile).
+
+1. Push this repo to GitHub.
+2. In Render, click **New +** -> **Web Service**.
+3. Connect your repo and choose the branch to deploy.
+4. In service settings:
+   - Environment: `Docker`
+   - Health Check Path: `/health`
+   - Auto-Deploy: your preference
+5. Add environment variables:
+   - `OPENROUTER_API_KEY` (required)
+   - `OPENROUTER_MODEL` (recommended default: `openai/gpt-4.1-mini`)
+   - `AUTO_BROWSE_API_TOKEN` (required shared token for API requests)
+6. Click **Create Web Service** and wait for deploy to complete.
+
+Render uses the container `CMD` from the Dockerfile, which runs `./scripts/run_api.sh`.
+
+Quick verification after deploy:
 
 ```bash
-pip install -e . && playwright install chromium
+curl https://<your-render-url>/health
 ```
 
-Start command:
+Example API call:
 
 ```bash
-./scripts/run_api.sh
+curl -X POST "https://<your-render-url>/run" \
+  -H "X-API-Token: <AUTO_BROWSE_API_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start_url": "https://www.google.com",
+    "target_prompt": "release date of Star Wars",
+    "max_steps": 10,
+    "max_actions_per_step": 2
+  }'
 ```
-
-Required env vars:
-
-- `OPENROUTER_API_KEY`
-- `OPENROUTER_MODEL`
-- `AUTO_BROWSE_API_TOKEN`
 
 ## Use In Other Projects
 
