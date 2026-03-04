@@ -81,6 +81,7 @@ Notes:
 - `AUTO_BROWSE_SECURITY_CONFIG_PATH` can point to a different config file path if needed.
 - `start_url` accepts either a full URL (`https://...`) or a hostname (`www.google.com`), which is auto-normalized to `https://...`.
 - The API always logs intermediary step summaries and next actions.
+- `/run` enforces a cooldown of 1 accepted request every 20 seconds (HTTP `429` with `Retry-After` when exceeded).
 - `max_actions_per_step` controls how many tool calls the model may emit in one turn (`1..4`).
 - Optional schema extraction:
   - `extraction_schema`: `{ "field_name": "field description" }`

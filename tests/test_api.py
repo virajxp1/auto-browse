@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from playwright.async_api import Error as PlaywrightError
 
 from agent.models import AgentResult
-from auto_browse.api import create_app
+from auto_browse.api import _RunCooldownLimiter, create_app
 from auto_browse.security import DEFAULT_API_TOKEN_HEADER, SecuritySettings
 
 TEST_SHARED_API_TOKEN = "test-shared-token"
@@ -68,23 +68,42 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
         mock_run_agent.assert_not_awaited()
 
-    def test_run_rejects_when_another_run_is_in_progress(self) -> None:
+    def test_run_rejects_when_run_cooldown_is_active(self) -> None:
         with (
-            patch("auto_browse.api._RunConcurrencyGate.try_acquire", return_value=False),
+            patch(
+                "auto_browse.api._RunCooldownLimiter.try_acquire",
+                side_effect=[(True, 0), (False, 20)],
+            ),
             patch("auto_browse.api.logger.warning") as mock_logger_warning,
-            patch("auto_browse.api.run_agent", new=AsyncMock()) as mock_run_agent,
+            patch("auto_browse.api.OpenRouterClient.from_env", return_value=object()),
+            patch(
+                "auto_browse.api.run_agent",
+                new=AsyncMock(
+                    return_value=AgentResult(
+                        answer="ok",
+                        source_url="https://example.com",
+                        evidence="ok",
+                        confidence=0.8,
+                        trace=[],
+                    )
+                ),
+            ) as mock_run_agent,
         ):
-            response = _build_client().post("/run", headers=_auth_headers(), json=_run_payload())
+            client = _build_client()
+            first_response = client.post("/run", headers=_auth_headers(), json=_run_payload())
+            second_response = client.post("/run", headers=_auth_headers(), json=_run_payload())
 
-        self.assertEqual(response.status_code, 429)
-        self.assertIn("already in progress", response.json()["detail"])
+        self.assertEqual(first_response.status_code, 200)
+        self.assertEqual(second_response.status_code, 429)
+        self.assertIn("limited to 1 request every 20 seconds", second_response.json()["detail"])
+        self.assertEqual(second_response.headers.get("Retry-After"), "20")
         blocked_logs = [
             call
             for call in mock_logger_warning.call_args_list
-            if call.args and call.args[0] == "[run:%s trace:%s] blocked_by_gate active_runs=%s max_active_runs=%s"
+            if call.args and call.args[0] == "[run:%s trace:%s] blocked_by_rate_limit retry_after=%s cooldown_seconds=%s"
         ]
         self.assertEqual(len(blocked_logs), 1)
-        mock_run_agent.assert_not_awaited()
+        self.assertEqual(mock_run_agent.await_count, 1)
 
     def test_run_logs_input_and_output_payloads(self) -> None:
         with (
@@ -288,8 +307,9 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("Browser navigation failed", response.json()["detail"])
 
-    def test_run_releases_gate_after_value_error(self) -> None:
+    def test_run_allows_request_after_cooldown_following_value_error(self) -> None:
         with (
+            patch("auto_browse.api._RunCooldownLimiter.try_acquire", return_value=(True, 0)),
             patch("auto_browse.api.OpenRouterClient.from_env", return_value=object()),
             patch(
                 "auto_browse.api.run_agent",
@@ -316,8 +336,9 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(second_response.status_code, 200)
         self.assertEqual(second_response.json()["answer"], "ok")
 
-    def test_run_releases_gate_after_timeout_error(self) -> None:
+    def test_run_allows_request_after_cooldown_following_timeout_error(self) -> None:
         with (
+            patch("auto_browse.api._RunCooldownLimiter.try_acquire", return_value=(True, 0)),
             patch("auto_browse.api.OpenRouterClient.from_env", return_value=object()),
             patch(
                 "auto_browse.api.run_agent",
@@ -435,3 +456,22 @@ class ApiTest(unittest.TestCase):
                 "director": "The director name",
             },
         )
+
+
+class RunCooldownLimiterTest(unittest.TestCase):
+    def test_limiter_blocks_request_inside_cooldown_window(self) -> None:
+        limiter = _RunCooldownLimiter(min_interval_seconds=20.0)
+
+        is_allowed_first, retry_after_first = limiter.try_acquire(now=100.0)
+        is_allowed_second, retry_after_second = limiter.try_acquire(now=110.2)
+
+        self.assertTrue(is_allowed_first)
+        self.assertEqual(retry_after_first, 0)
+        self.assertFalse(is_allowed_second)
+        self.assertEqual(retry_after_second, 10)
+
+    def test_limiter_allows_request_after_cooldown_window(self) -> None:
+        limiter = _RunCooldownLimiter(min_interval_seconds=20.0)
+
+        self.assertEqual(limiter.try_acquire(now=100.0), (True, 0))
+        self.assertEqual(limiter.try_acquire(now=120.0), (True, 0))
