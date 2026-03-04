@@ -178,6 +178,16 @@ def create_app(security: SecuritySettings | None = None) -> FastAPI:
             response_payload = {"detail": exc.detail}
             logger.info("[run:%s trace:%s] output_payload=%s", request_id, trace_id, response_payload)
             raise
+        except Exception as exc:
+            response_payload = {"detail": "Unhandled internal error occurred"}
+            logger.exception(
+                "[run:%s trace:%s] unhandled_exception error=%s",
+                request_id,
+                trace_id,
+                str(exc),
+            )
+            logger.info("[run:%s trace:%s] output_payload=%s", request_id, trace_id, response_payload)
+            raise HTTPException(status_code=500, detail=response_payload["detail"]) from exc
 
         try:
             result = await run_agent(
@@ -204,6 +214,16 @@ def create_app(security: SecuritySettings | None = None) -> FastAPI:
             response_payload = {"detail": str(exc)}
             logger.info("[run:%s trace:%s] output_payload=%s", request_id, trace_id, response_payload)
             raise HTTPException(status_code=400, detail=response_payload["detail"]) from exc
+        except Exception as exc:
+            response_payload = {"detail": "Unhandled internal error occurred"}
+            logger.exception(
+                "[run:%s trace:%s] unhandled_exception error=%s",
+                request_id,
+                trace_id,
+                str(exc),
+            )
+            logger.info("[run:%s trace:%s] output_payload=%s", request_id, trace_id, response_payload)
+            raise HTTPException(status_code=500, detail=response_payload["detail"]) from exc
 
         if result.error:
             logger.info(

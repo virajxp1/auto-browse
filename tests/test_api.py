@@ -307,6 +307,38 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("Browser navigation failed", response.json()["detail"])
 
+    def test_run_maps_unexpected_run_agent_error_to_500_and_logs_exception(self) -> None:
+        with (
+            patch("auto_browse.api.OpenRouterClient.from_env", return_value=object()),
+            patch("auto_browse.api.logger.exception") as mock_logger_exception,
+            patch(
+                "auto_browse.api.run_agent",
+                new=AsyncMock(side_effect=RuntimeError("boom")),
+            ),
+        ):
+            response = _build_client().post("/run", headers=_auth_headers(), json=_run_payload())
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["detail"], "Unhandled internal error occurred")
+        self.assertEqual(mock_logger_exception.call_count, 1)
+        self.assertEqual(
+            mock_logger_exception.call_args.args[0],
+            "[run:%s trace:%s] unhandled_exception error=%s",
+        )
+
+    def test_run_maps_unexpected_client_init_error_to_500_and_logs_exception(self) -> None:
+        with (
+            patch("auto_browse.api.OpenRouterClient.from_env", side_effect=RuntimeError("config boom")),
+            patch("auto_browse.api.logger.exception") as mock_logger_exception,
+            patch("auto_browse.api.run_agent", new=AsyncMock()) as mock_run_agent,
+        ):
+            response = _build_client().post("/run", headers=_auth_headers(), json=_run_payload())
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["detail"], "Unhandled internal error occurred")
+        self.assertEqual(mock_logger_exception.call_count, 1)
+        mock_run_agent.assert_not_awaited()
+
     def test_run_allows_request_after_cooldown_following_value_error(self) -> None:
         with (
             patch("auto_browse.api._RunCooldownLimiter.try_acquire", return_value=(True, 0)),
