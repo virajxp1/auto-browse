@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import configparser
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from langchain_openai import ChatOpenAI
+
+DEFAULT_OPENROUTER_CONFIG_PATH = "config/config.ini"
 
 
 def _get_required_env_any(names: list[str]) -> str:
@@ -42,6 +45,36 @@ def _load_env_file_if_present(path: Path = Path(".env")) -> None:
         os.environ.setdefault(key, value)
 
 
+def _resolve_openrouter_config_path() -> Path:
+    configured_path = os.getenv(
+        "AUTO_BROWSE_OPENROUTER_CONFIG_PATH",
+        DEFAULT_OPENROUTER_CONFIG_PATH,
+    ).strip()
+    if not configured_path:
+        raise ValueError("AUTO_BROWSE_OPENROUTER_CONFIG_PATH cannot be empty")
+    return Path(configured_path)
+
+
+def _read_model_name_from_config(path: Path) -> str:
+    if not path.is_file():
+        raise ValueError(f"Missing OpenRouter config file: {path}")
+
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(path, encoding="utf-8")
+    except configparser.Error as exc:
+        raise ValueError(f"Failed to parse OpenRouter config file: {path}") from exc
+
+    if "openrouter" not in parser:
+        raise ValueError("OpenRouter config file must contain an [openrouter] section")
+
+    model_name = parser.get("openrouter", "model", fallback="").strip()
+    if not model_name:
+        raise ValueError("OpenRouter config file must set [openrouter].model")
+
+    return model_name
+
+
 @dataclass
 class OpenRouterClient:
     api_key: str
@@ -51,7 +84,8 @@ class OpenRouterClient:
     def from_env(cls) -> "OpenRouterClient":
         _load_env_file_if_present()
         api_key = _get_required_env_any(["OPENROUTER_API_KEY", "OPEN_ROUTER_API_KEY"])
-        model_name = _get_required_env_any(["OPENROUTER_MODEL"])
+        config_path = _resolve_openrouter_config_path()
+        model_name = _read_model_name_from_config(config_path)
         return cls(api_key=api_key, model_name=model_name)
 
     def chat_model(self) -> ChatOpenAI:

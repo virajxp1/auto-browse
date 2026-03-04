@@ -27,10 +27,14 @@ At every step, the API logs:
    ```bash
    cp .env.example .env
    export OPENROUTER_API_KEY=...
-   export OPENROUTER_MODEL=openai/gpt-4.1-mini
    export AUTO_BROWSE_API_TOKEN=replace-with-shared-token
    ```
    The runtime also auto-loads these keys from a local `.env` file if present.
+3. Set the model in `config/config.ini`:
+   ```ini
+   [openrouter]
+   model = gpt-oss-20b
+   ```
 
 ## Run As API
 
@@ -62,9 +66,10 @@ curl -X POST "http://127.0.0.1:8000/run" \
 
 Notes:
 
-- The API uses env credentials/model only (`OPENROUTER_API_KEY`, `OPENROUTER_MODEL`).
+- The API reads OpenRouter credentials from env (`OPENROUTER_API_KEY`) and model from `config/config.ini`.
 - Startup requires `AUTO_BROWSE_API_TOKEN` (recommended in `.env`).
 - Every request must include the shared token header (`X-API-Token`) matching `AUTO_BROWSE_API_TOKEN`.
+- `AUTO_BROWSE_OPENROUTER_CONFIG_PATH` can point to a different INI config path if needed.
 - Built-in middleware adds basic DDoS controls configured in `config/security.toml`:
   - `max_request_body_bytes` (default `65536`)
   - `rate_limit_max_requests` per `rate_limit_window_seconds` (defaults `30` per `60s`)
@@ -98,9 +103,14 @@ Deploy this repo as a standard Render **Web Service** using the included [`Docke
    - Auto-Deploy: your preference
 5. Add environment variables:
    - `OPENROUTER_API_KEY` (required)
-   - `OPENROUTER_MODEL` (recommended default: `openai/gpt-4.1-mini`)
    - `AUTO_BROWSE_API_TOKEN` (required shared token for API requests)
-6. Click **Create Web Service** and wait for deploy to complete.
+6. Ensure your deployed config sets `config/config.ini`:
+   ```ini
+   [openrouter]
+   model = gpt-oss-20b
+   ```
+   You can override the config path via `AUTO_BROWSE_OPENROUTER_CONFIG_PATH`.
+7. Click **Create Web Service** and wait for deploy to complete.
 
 Render uses the container `CMD` from the Dockerfile, which runs `./scripts/run_api.sh`.
 
@@ -123,7 +133,6 @@ curl -X POST "https://<your-render-url>/run" \
     "max_actions_per_step": 2
   }'
 ```
-
 ## Use In Other Projects
 
 Install as a dependency:
