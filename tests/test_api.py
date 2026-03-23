@@ -220,6 +220,32 @@ class ApiTest(unittest.TestCase):
         mock_run_agent.assert_awaited_once()
         self.assertTrue(callable(mock_run_agent.await_args.kwargs["on_step"]))
         self.assertIsInstance(mock_run_agent.await_args.kwargs["trace_id"], str)
+        self.assertIsNone(mock_run_agent.await_args.kwargs["trace_parent"])
+
+    def test_run_forwards_braintrust_parent_header(self) -> None:
+        with (
+            patch("auto_browse.api.OpenRouterClient.from_env", return_value=object()),
+            patch(
+                "auto_browse.api.run_agent",
+                new=AsyncMock(
+                    return_value=AgentResult(
+                        answer="ok",
+                        source_url="https://example.com",
+                        evidence="ok",
+                        confidence=0.8,
+                        trace=[],
+                    )
+                ),
+            ) as mock_run_agent,
+        ):
+            response = _build_client().post(
+                "/run",
+                headers={**_auth_headers(), "X-BT-Parent": " parent-token "},
+                json=_run_payload(),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_run_agent.await_args.kwargs["trace_parent"], "parent-token")
 
     def test_run_rejects_request_level_api_key(self) -> None:
         response = _build_client().post(

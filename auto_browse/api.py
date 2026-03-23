@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from playwright.async_api import Error as PlaywrightError
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -119,9 +119,10 @@ def create_app(security: SecuritySettings | None = None) -> FastAPI:
         return {"status": "ok"}
 
     @app.post("/run", response_model=AgentResult)
-    async def run(payload: RunRequest) -> AgentResult:
+    async def run(payload: RunRequest, request: Request) -> AgentResult:
         request_id = uuid.uuid4().hex[:8]
         trace_id = _new_trace_id()
+        trace_parent = request.headers.get("x-bt-parent", "").strip() or None
 
         def _log_step(trace_item: AgentStepTrace) -> None:
             logger.info(
@@ -201,6 +202,7 @@ def create_app(security: SecuritySettings | None = None) -> FastAPI:
                 headless=not payload.headed,
                 on_step=_log_step,
                 trace_id=trace_id,
+                trace_parent=trace_parent,
             )
         except PlaywrightError as exc:
             response_payload = {"detail": f"Browser navigation failed: {exc}"}
