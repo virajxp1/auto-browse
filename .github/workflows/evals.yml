@@ -16,11 +16,13 @@ on:
 
 jobs:
   run-evals:
-    if: ${{ secrets.OPENROUTER_API_KEY != '' && secrets.BRAINTRUST_API_KEY != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
       contents: read
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      BRAINTRUST_API_KEY: ${{ secrets.BRAINTRUST_API_KEY }}
 
     steps:
       - name: Checkout
@@ -32,21 +34,25 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
+        if: ${{ env.OPENROUTER_API_KEY != '' && env.BRAINTRUST_API_KEY != '' }}
         run: |
           python -m pip install --upgrade pip
           pip install .
           python -m playwright install --with-deps chromium
 
       - name: Run evals
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          BRAINTRUST_API_KEY: ${{ secrets.BRAINTRUST_API_KEY }}
+        if: ${{ env.OPENROUTER_API_KEY != '' && env.BRAINTRUST_API_KEY != '' }}
         run: |
           mkdir -p .context
           python scripts/run_eval.py \
             --repeats 1 \
             --output .context/eval_report_ci.json \
             --max-concurrency 1
+
+      - name: Skip evals when required secrets are missing
+        if: ${{ env.OPENROUTER_API_KEY == '' || env.BRAINTRUST_API_KEY == '' }}
+        run: |
+          echo "Skipping evals because OPENROUTER_API_KEY and/or BRAINTRUST_API_KEY are not configured."
 
       - name: Upload eval report
         if: always()

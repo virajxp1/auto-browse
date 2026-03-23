@@ -71,7 +71,10 @@ curl -X POST "http://127.0.0.1:8000/run" \
 
 Notes:
 
-- The API reads OpenRouter credentials from env (`OPENROUTER_API_KEY`) and model from `config/config.ini`.
+- The API reads OpenRouter credentials from env (`OPENROUTER_API_KEY`) and model from config with this precedence:
+  - `AUTO_BROWSE_OPENROUTER_CONFIG_PATH`, if set
+  - local `config/config.ini`, if present
+  - packaged default bundled with `agent` (wheel-friendly fallback)
 - Startup requires `AUTO_BROWSE_API_TOKEN` (recommended in `.env`).
 - Every request must include the shared token header (`X-API-Token`) matching `AUTO_BROWSE_API_TOKEN`.
 - Built-in middleware adds basic DDoS controls configured in `config/security.toml`:
@@ -126,7 +129,7 @@ Deploy this repo as a standard Render **Web Service** using the included [`Docke
    [braintrust]
    project_id = 11726530-f1d2-4490-b9ba-7d8996e37880
    ```
-   This path is fixed at `config/config.ini`.
+   You can override this path with `AUTO_BROWSE_OPENROUTER_CONFIG_PATH`.
 7. Click **Create Web Service** and wait for deploy to complete.
 
 Render uses the container `CMD` from the Dockerfile, which runs `./scripts/run_api.sh`.

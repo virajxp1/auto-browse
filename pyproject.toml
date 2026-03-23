@@ -25,3 +25,6 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["agent*", "auto_browse*"]
+
+[tool.setuptools.package-data]
+agent = ["*.ini"]

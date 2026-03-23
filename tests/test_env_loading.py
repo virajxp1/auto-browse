@@ -60,7 +60,7 @@ class EnvLoadingTest(unittest.TestCase):
         self.assertEqual(client.api_key, "test_key_alias")
         self.assertEqual(client.model_name, "test_model")
 
-    def test_from_env_ignores_openrouter_config_path_override_env_var(self) -> None:
+    def test_from_env_respects_openrouter_config_path_override_env_var(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             env_path = Path(tmpdir) / ".env"
             env_path.write_text(
@@ -92,4 +92,23 @@ class EnvLoadingTest(unittest.TestCase):
                 os.chdir(old_cwd)
 
         self.assertEqual(client.api_key, "test_key")
-        self.assertEqual(client.model_name, "from-default-config")
+        self.assertEqual(client.model_name, "openai/gpt-4o-mini")
+
+    def test_from_env_falls_back_to_packaged_default_when_config_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_path = Path(tmpdir) / ".env"
+            env_path.write_text(
+                "OPENROUTER_API_KEY=test_key\n",
+                encoding="utf-8",
+            )
+
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tmpdir)
+                with patch.dict(os.environ, {}, clear=True):
+                    client = OpenRouterClient.from_env()
+            finally:
+                os.chdir(old_cwd)
+
+        self.assertEqual(client.api_key, "test_key")
+        self.assertEqual(client.model_name, "gpt-oss-20b")
