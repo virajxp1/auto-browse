@@ -14,7 +14,6 @@ from pydantic import BaseModel, ConfigDict, Field
 from agent.browser import capture_state, run_browser
 from agent.extract import page_to_markdown
 from agent.models import AgentDecision, AgentResult, AgentStepTrace, PageState
-from agent.observability import flush as flush_observability
 from agent.observability import span_log, start_span
 from agent.openrouter_client import OpenRouterClient
 from agent.planner import build_llm_messages
@@ -1523,78 +1522,75 @@ async def run_agent(
         raise ValueError("extraction_selector_empty")
 
     resolved_trace_id = trace_id or _new_trace_id()
-    try:
-        with start_span(
-            name="auto_browse_agent_run",
-            span_type="task",
-            parent=trace_parent,
-            metadata={
-                "run_id": resolved_trace_id,
-                "max_steps": max_steps,
-                "max_actions_per_step": max_actions_per_step,
-            },
-            input={
-                "start_url": start_url,
-                "target_prompt": target_prompt,
-                "headless": headless,
-                "extraction_schema_fields": sorted(normalized_extraction_schema.keys())
-                if normalized_extraction_schema
-                else None,
-                "extraction_selector": normalized_extraction_selector,
-            },
-            tags=[f"run_id:{resolved_trace_id}"],
-        ) as run_span:
-            pw, browser, page = await run_browser(start_url, headless=headless)
-            runtime = _Runtime(
-                openrouter_client=openrouter_client,
-                page=page,
-                target_prompt=target_prompt,
-                max_steps=max_steps,
-                max_actions_per_step=max_actions_per_step,
-                extraction_schema=normalized_extraction_schema,
-                extraction_selector=normalized_extraction_selector,
-                on_step=on_step,
-                trace_id=resolved_trace_id,
-            )
-            graph = _build_graph(runtime)
+    with start_span(
+        name="auto_browse_agent_run",
+        span_type="task",
+        parent=trace_parent,
+        metadata={
+            "run_id": resolved_trace_id,
+            "max_steps": max_steps,
+            "max_actions_per_step": max_actions_per_step,
+        },
+        input={
+            "start_url": start_url,
+            "target_prompt": target_prompt,
+            "headless": headless,
+            "extraction_schema_fields": sorted(normalized_extraction_schema.keys())
+            if normalized_extraction_schema
+            else None,
+            "extraction_selector": normalized_extraction_selector,
+        },
+        tags=[f"run_id:{resolved_trace_id}"],
+    ) as run_span:
+        pw, browser, page = await run_browser(start_url, headless=headless)
+        runtime = _Runtime(
+            openrouter_client=openrouter_client,
+            page=page,
+            target_prompt=target_prompt,
+            max_steps=max_steps,
+            max_actions_per_step=max_actions_per_step,
+            extraction_schema=normalized_extraction_schema,
+            extraction_selector=normalized_extraction_selector,
+            on_step=on_step,
+            trace_id=resolved_trace_id,
+        )
+        graph = _build_graph(runtime)
 
-            initial_state: AgentGraphState = AgentGraphState(
-                step=0,
-                trace=[],
-                page_state=None,
-                result=None,
-                messages=[],
-                action_observations=[],
-            )
+        initial_state: AgentGraphState = AgentGraphState(
+            step=0,
+            trace=[],
+            page_state=None,
+            result=None,
+            messages=[],
+            action_observations=[],
+        )
 
-            try:
-                final_state = await graph.ainvoke(initial_state)
-                result = final_state.get("result")
-                if result is None:
-                    fallback_result = AgentResult(
-                        error="graph_finished_without_result",
-                        trace=final_state.get("trace", []),
-                    )
-                    span_log(
-                        run_span,
-                        output={
-                            "error": fallback_result.error,
-                            "trace_steps": len(fallback_result.trace),
-                        },
-                    )
-                    return fallback_result
+        try:
+            final_state = await graph.ainvoke(initial_state)
+            result = final_state.get("result")
+            if result is None:
+                fallback_result = AgentResult(
+                    error="graph_finished_without_result",
+                    trace=final_state.get("trace", []),
+                )
                 span_log(
                     run_span,
                     output={
-                        "final_result": _result_for_root_span_log(result),
+                        "error": fallback_result.error,
+                        "trace_steps": len(fallback_result.trace),
                     },
                 )
-                return result
-            except Exception as exc:
-                span_log(run_span, error=str(exc))
-                raise
-            finally:
-                await browser.close()
-                await pw.stop()
-    finally:
-        flush_observability()
+                return fallback_result
+            span_log(
+                run_span,
+                output={
+                    "final_result": _result_for_root_span_log(result),
+                },
+            )
+            return result
+        except Exception as exc:
+            span_log(run_span, error=str(exc))
+            raise
+        finally:
+            await browser.close()
+            await pw.stop()
