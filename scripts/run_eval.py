@@ -631,20 +631,6 @@ async def _run_eval(
         _ = kwargs
         return 1.0 if isinstance(output, dict) and bool(output.get("success")) else 0.0
 
-    def score_trace_steps(_input: Any, output: Any, expected: Any = None, **kwargs: Any) -> float:
-        _ = expected
-        _ = kwargs
-        if not isinstance(output, dict):
-            return 0.0
-        return float(int(output.get("trace_steps") or 0))
-
-    def score_duration_s(_input: Any, output: Any, expected: Any = None, **kwargs: Any) -> float:
-        _ = expected
-        _ = kwargs
-        if not isinstance(output, dict):
-            return 0.0
-        return float(output.get("duration_s") or 0.0)
-
     async def score_coherence(input: Any, output: Any, expected: Any = None, **kwargs: Any) -> dict[str, Any]:
         _ = expected
         _ = kwargs
@@ -678,7 +664,7 @@ async def _run_eval(
         experiment_name=None,
         data=lambda: eval_cases,
         task=run_eval_task,
-        scores=[score_success, score_trace_steps, score_duration_s, score_coherence, score_factuality],
+        scores=[score_success, score_coherence, score_factuality],
         trial_count=repeats,
         no_send_logs=False,
         max_concurrency=max_concurrency,
