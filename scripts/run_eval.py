@@ -421,6 +421,45 @@ def _set_hook_metadata(hooks: Any, task: EvalTask, record: dict[str, Any]) -> No
         tags.append("complex")
 
 
+def _initial_task_record(task: EvalTask, *, repeat_index: int, total_repeats: int) -> dict[str, Any]:
+    return {
+        "task_id": task.task_id,
+        "repeat": repeat_index + 1,
+        "total_repeats": total_repeats,
+        "is_complex": task.is_complex(),
+        "success": False,
+        "error": None,
+        "duration_s": 0.0,
+        "trace_steps": 0,
+        "actions": [],
+        "answer": None,
+        "structured_data": None,
+        "evidence": None,
+        "source_url": None,
+    }
+
+
+def _normalize_repeat_from_metadata(metadata: dict[str, Any]) -> int:
+    explicit_repeat = metadata.get("repeat")
+    if explicit_repeat not in (None, ""):
+        try:
+            parsed_repeat = int(explicit_repeat)
+            if parsed_repeat >= 1:
+                return parsed_repeat
+        except Exception:
+            pass
+
+    try:
+        trial_index = int(metadata.get("trial_index") or 0)
+    except Exception:
+        trial_index = 0
+    return max(1, trial_index + 1)
+
+
+def _zero_score_error_handler(_span: Any, _datum: Any, unhandled_scores: list[str]) -> dict[str, float]:
+    return {str(score_name): 0.0 for score_name in unhandled_scores}
+
+
 def _record_from_eval_result(result: Any, *, total_repeats: int) -> dict[str, Any]:
     output = getattr(result, "output", None)
     if isinstance(output, dict):
@@ -433,11 +472,11 @@ def _record_from_eval_result(result: Any, *, total_repeats: int) -> dict[str, An
         if not isinstance(metadata, dict):
             metadata = {}
 
-        trial_index = int(metadata.get("repeat") or metadata.get("trial_index") or 1)
+        repeat = _normalize_repeat_from_metadata(metadata)
         task_id = str(metadata.get("task_id") or input_payload.get("id") or "unknown_task")
         record = {
             "task_id": task_id,
-            "repeat": trial_index,
+            "repeat": repeat,
             "total_repeats": int(metadata.get("total_repeats") or total_repeats),
             "is_complex": bool(metadata.get("is_complex")),
             "success": False,
@@ -571,6 +610,11 @@ async def _run_eval(
     async def run_eval_task(task_payload: dict[str, Any], hooks: Any) -> dict[str, Any]:
         task = EvalTask.from_dict(task_payload)
         trial_index = int(getattr(hooks, "trial_index", 0))
+        _set_hook_metadata(
+            hooks,
+            task,
+            _initial_task_record(task, repeat_index=trial_index, total_repeats=repeats),
+        )
 
         record = await _run_single(
             client,
@@ -638,6 +682,7 @@ async def _run_eval(
         trial_count=repeats,
         no_send_logs=False,
         max_concurrency=max_concurrency,
+        error_score_handler=_zero_score_error_handler,
         metadata={
             "repeats": repeats,
             "data_source": "dataset",
