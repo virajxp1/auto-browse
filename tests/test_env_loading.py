@@ -60,7 +60,7 @@ class EnvLoadingTest(unittest.TestCase):
         self.assertEqual(client.api_key, "test_key_alias")
         self.assertEqual(client.model_name, "test_model")
 
-    def test_from_env_allows_openrouter_config_path_override(self) -> None:
+    def test_from_env_ignores_openrouter_config_path_override_env_var(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             env_path = Path(tmpdir) / ".env"
             env_path.write_text(
@@ -68,6 +68,12 @@ class EnvLoadingTest(unittest.TestCase):
                     "OPENROUTER_API_KEY=test_key\n"
                     "AUTO_BROWSE_OPENROUTER_CONFIG_PATH=settings/custom.ini\n"
                 ),
+                encoding="utf-8",
+            )
+            config_dir = Path(tmpdir) / "config"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            (config_dir / "config.ini").write_text(
+                "[openrouter]\nmodel=from-default-config\n",
                 encoding="utf-8",
             )
             settings_dir = Path(tmpdir) / "settings"
@@ -86,4 +92,4 @@ class EnvLoadingTest(unittest.TestCase):
                 os.chdir(old_cwd)
 
         self.assertEqual(client.api_key, "test_key")
-        self.assertEqual(client.model_name, "openai/gpt-4o-mini")
+        self.assertEqual(client.model_name, "from-default-config")

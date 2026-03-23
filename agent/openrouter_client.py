@@ -7,7 +7,7 @@ from pathlib import Path
 
 from langchain_openai import ChatOpenAI
 
-DEFAULT_OPENROUTER_CONFIG_PATH = "config/config.ini"
+DEFAULT_OPENROUTER_CONFIG_PATH = Path("config/config.ini")
 
 
 def _get_required_env_any(names: list[str]) -> str:
@@ -45,16 +45,6 @@ def _load_env_file_if_present(path: Path = Path(".env")) -> None:
         os.environ.setdefault(key, value)
 
 
-def _resolve_openrouter_config_path() -> Path:
-    configured_path = os.getenv(
-        "AUTO_BROWSE_OPENROUTER_CONFIG_PATH",
-        DEFAULT_OPENROUTER_CONFIG_PATH,
-    ).strip()
-    if not configured_path:
-        raise ValueError("AUTO_BROWSE_OPENROUTER_CONFIG_PATH cannot be empty")
-    return Path(configured_path)
-
-
 def _read_model_name_from_config(path: Path) -> str:
     if not path.is_file():
         raise ValueError(f"Missing OpenRouter config file: {path}")
@@ -84,8 +74,7 @@ class OpenRouterClient:
     def from_env(cls) -> "OpenRouterClient":
         _load_env_file_if_present()
         api_key = _get_required_env_any(["OPENROUTER_API_KEY", "OPEN_ROUTER_API_KEY"])
-        config_path = _resolve_openrouter_config_path()
-        model_name = _read_model_name_from_config(config_path)
+        model_name = _read_model_name_from_config(DEFAULT_OPENROUTER_CONFIG_PATH)
         return cls(api_key=api_key, model_name=model_name)
 
     def chat_model(self) -> ChatOpenAI:

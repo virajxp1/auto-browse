@@ -3,9 +3,9 @@ from __future__ import annotations
 import re
 import uuid
 from dataclasses import dataclass
-from typing import Awaitable, Callable, TypedDict
+from typing import Any, Awaitable, Callable, TypedDict
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.graph import END, START, StateGraph
 from playwright.async_api import Page
@@ -14,6 +14,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from agent.browser import capture_state, run_browser
 from agent.extract import page_to_markdown
 from agent.models import AgentDecision, AgentResult, AgentStepTrace, PageState
+from agent.observability import flush as flush_observability
+from agent.observability import span_log, start_span
 from agent.openrouter_client import OpenRouterClient
 from agent.planner import build_llm_messages
 
@@ -199,6 +201,34 @@ def _normalize_tool_text(value: str) -> str:
     text = value.replace("\u00a0", " ").replace("\u202f", " ").replace("\u2007", " ")
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+def _truncate_for_span_log(value: str, *, limit: int = 1500) -> str:
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}...<truncated>"
+
+
+def _result_for_root_span_log(result: AgentResult) -> dict[str, Any]:
+    return {
+        "answer": _truncate_for_span_log(result.answer) if result.answer else None,
+        "structured_data": result.structured_data,
+        "source_url": result.source_url,
+        "evidence": _truncate_for_span_log(result.evidence) if result.evidence else None,
+        "confidence": result.confidence,
+        "error": result.error,
+        "trace_steps": len(result.trace),
+    }
+
+
+def _serialize_llm_message(message: Any) -> dict[str, Any]:
+    if isinstance(message, BaseMessage):
+        return message.model_dump()
+    return {"type": type(message).__name__, "value": str(message)}
+
+
+def _serialize_llm_messages(messages: list[BaseMessage]) -> list[dict[str, Any]]:
+    return [_serialize_llm_message(message) for message in messages]
 
 
 def _extract_markdown_table_rows(markdown: str) -> list[tuple[str, str]]:
@@ -1071,11 +1101,23 @@ def _build_graph(runtime: _Runtime):
         if state["result"] is not None:
             return state
 
-        page_state = await capture_state(runtime.page)
-        page_state.markdown = await page_to_markdown(
-            runtime.page,
-            selector=runtime.extraction_selector,
-        )
+        with start_span(
+            name=f"capture.{state['step'] + 1}",
+            span_type="task",
+            metadata={"run_id": runtime.trace_id, "step": state["step"]},
+        ) as capture_span:
+            page_state = await capture_state(runtime.page)
+            page_state.markdown = await page_to_markdown(
+                runtime.page,
+                selector=runtime.extraction_selector,
+            )
+            span_log(
+                capture_span,
+                output={
+                    "url": page_state.url,
+                    "title": page_state.title,
+                },
+            )
 
         state["page_state"] = page_state
         return state
@@ -1094,18 +1136,40 @@ def _build_graph(runtime: _Runtime):
             extraction_selector=runtime.extraction_selector,
             max_actions_per_step=runtime.max_actions_per_step,
         )
-        message = await llm_with_tools.ainvoke(
-            base_messages,
-            **_openrouter_invoke_kwargs(runtime, state["step"]),
-        )
-        if not isinstance(message, AIMessage):
-            return _set_error(state, "llm_response_not_ai_message")
+        with start_span(
+            name=f"planner.{state['step'] + 1}",
+            span_type="llm",
+            metadata={"run_id": runtime.trace_id, "step": state["step"]},
+            input={
+                "target_prompt": runtime.target_prompt,
+                "url": state["page_state"].url,
+                "history_steps": len(state["trace"]),
+                "max_actions_per_step": runtime.max_actions_per_step,
+            },
+        ) as llm_span:
+            llm_calls: list[dict[str, Any]] = []
+            message = await llm_with_tools.ainvoke(
+                base_messages,
+                **_openrouter_invoke_kwargs(runtime, state["step"]),
+            )
+            llm_calls.append(
+                {
+                    "request_messages": _serialize_llm_messages(base_messages),
+                    "response": _serialize_llm_message(message),
+                }
+            )
+            if not isinstance(message, AIMessage):
+                span_log(
+                    llm_span,
+                    output={"error": "llm_response_not_ai_message", "llm_calls": llm_calls},
+                )
+                return _set_error(state, "llm_response_not_ai_message")
 
-        tool_calls = message.tool_calls or []
-        if not tool_calls:
-            retry_message = await llm_with_tools.ainvoke(
-                base_messages
-                + [
+            tool_calls = message.tool_calls or []
+            retried_for_tool_call = False
+            if not tool_calls:
+                retried_for_tool_call = True
+                retry_messages = base_messages + [
                     HumanMessage(
                         content=(
                             "You returned no tool call. "
@@ -1113,26 +1177,68 @@ def _build_graph(runtime: _Runtime):
                             "Do not repeat a blocked or identical previous action."
                         )
                     )
-                ],
-                **_openrouter_invoke_kwargs(runtime, state["step"]),
-            )
-            if isinstance(retry_message, AIMessage):
-                message = retry_message
-                tool_calls = message.tool_calls or []
+                ]
+                retry_message = await llm_with_tools.ainvoke(
+                    retry_messages,
+                    **_openrouter_invoke_kwargs(runtime, state["step"]),
+                )
+                llm_calls.append(
+                    {
+                        "request_messages": _serialize_llm_messages(retry_messages),
+                        "response": _serialize_llm_message(retry_message),
+                    }
+                )
+                if isinstance(retry_message, AIMessage):
+                    message = retry_message
+                    tool_calls = message.tool_calls or []
 
-        if not tool_calls:
-            return _set_error(state, "llm_returned_no_tool_call")
-        if len(tool_calls) > runtime.max_actions_per_step:
-            if runtime.max_actions_per_step == 1:
-                return _set_error(state, "llm_returned_multiple_tool_calls")
-            return _set_error(state, "llm_returned_too_many_tool_calls")
-        if len(tool_calls) > 1 and any(
-            call.get("name") in {"extract_answer", "fail"} for call in tool_calls[:-1]
-        ):
-            return _set_error(state, "llm_returned_invalid_terminal_tool_order")
-        state["messages"] = [message]
-        state["action_observations"] = []
-        return state
+            if not tool_calls:
+                span_log(
+                    llm_span,
+                    output={"error": "llm_returned_no_tool_call", "llm_calls": llm_calls},
+                )
+                return _set_error(state, "llm_returned_no_tool_call")
+            if len(tool_calls) > runtime.max_actions_per_step:
+                if runtime.max_actions_per_step == 1:
+                    span_log(
+                        llm_span,
+                        output={
+                            "error": "llm_returned_multiple_tool_calls",
+                            "llm_calls": llm_calls,
+                        },
+                    )
+                    return _set_error(state, "llm_returned_multiple_tool_calls")
+                span_log(
+                    llm_span,
+                    output={
+                        "error": "llm_returned_too_many_tool_calls",
+                        "llm_calls": llm_calls,
+                    },
+                )
+                return _set_error(state, "llm_returned_too_many_tool_calls")
+            if len(tool_calls) > 1 and any(
+                call.get("name") in {"extract_answer", "fail"} for call in tool_calls[:-1]
+            ):
+                span_log(
+                    llm_span,
+                    output={
+                        "error": "llm_returned_invalid_terminal_tool_order",
+                        "llm_calls": llm_calls,
+                    },
+                )
+                return _set_error(state, "llm_returned_invalid_terminal_tool_order")
+
+            span_log(
+                llm_span,
+                output={
+                    "tool_names": [str(call.get("name")) for call in tool_calls],
+                    "retried_for_tool_call": retried_for_tool_call,
+                    "llm_calls": llm_calls,
+                },
+            )
+            state["messages"] = [message]
+            state["action_observations"] = []
+            return state
 
     async def execute_tools_node(state: AgentGraphState) -> AgentGraphState:
         if state["result"] is not None:
@@ -1140,171 +1246,229 @@ def _build_graph(runtime: _Runtime):
         if not state["messages"]:
             return _set_error(state, "missing_ai_message")
 
-        ai_message = state["messages"][0]
-        if not isinstance(ai_message, AIMessage):
-            return _set_error(state, "invalid_ai_message")
+        with start_span(
+            name=f"execute_tools.{state['step'] + 1}",
+            span_type="task",
+            metadata={"run_id": runtime.trace_id, "step": state["step"]},
+        ) as tools_span:
+            ai_message = state["messages"][0]
+            if not isinstance(ai_message, AIMessage):
+                span_log(tools_span, output={"error": "invalid_ai_message"})
+                return _set_error(state, "invalid_ai_message")
 
-        tool_calls = ai_message.tool_calls or []
-        if not tool_calls:
-            return _set_error(state, "llm_returned_no_tool_call")
+            tool_calls = ai_message.tool_calls or []
+            if not tool_calls:
+                span_log(tools_span, output={"error": "llm_returned_no_tool_call"})
+                return _set_error(state, "llm_returned_no_tool_call")
 
-        tool_messages: list[ToolMessage] = []
-        observations: list[ActionObservation] = []
-        fallback_page_state = state.get("page_state")
-        fallback_url = fallback_page_state.url if fallback_page_state is not None else ""
-        fallback_title = fallback_page_state.title if fallback_page_state is not None else ""
-        for i, tool_call in enumerate(tool_calls):
-            tool_name = tool_call.get("name")
-            if not isinstance(tool_name, str) or not tool_name:
-                return _set_error(state, "tool_call_missing_name")
+            tool_messages: list[ToolMessage] = []
+            observations: list[ActionObservation] = []
+            fallback_page_state = state.get("page_state")
+            fallback_url = fallback_page_state.url if fallback_page_state is not None else ""
+            fallback_title = fallback_page_state.title if fallback_page_state is not None else ""
+            for i, tool_call in enumerate(tool_calls):
+                tool_name = tool_call.get("name")
+                if not isinstance(tool_name, str) or not tool_name:
+                    span_log(tools_span, output={"error": "tool_call_missing_name"})
+                    return _set_error(state, "tool_call_missing_name")
 
-            tool_def = tools_by_name.get(tool_name)
-            if tool_def is None:
-                return _set_error(state, "tool_not_found")
+                tool_def = tools_by_name.get(tool_name)
+                if tool_def is None:
+                    span_log(tools_span, output={"error": "tool_not_found", "tool_name": tool_name})
+                    return _set_error(state, "tool_not_found")
 
-            tool_args = tool_call.get("args", {})
-            if not isinstance(tool_args, dict):
-                return _set_error(state, "tool_call_args_not_object")
+                tool_args = tool_call.get("args", {})
+                if not isinstance(tool_args, dict):
+                    span_log(tools_span, output={"error": "tool_call_args_not_object", "tool_name": tool_name})
+                    return _set_error(state, "tool_call_args_not_object")
 
-            try:
-                tool_output = await tool_def.ainvoke(tool_args)
-            except Exception:
-                return _set_error(state, "tool_execution_failed")
+                with start_span(
+                    name=f"tool.{tool_name}",
+                    span_type="tool",
+                    metadata={
+                        "run_id": runtime.trace_id,
+                        "step": state["step"],
+                        "tool_index": i,
+                    },
+                    input={"args": tool_args},
+                ) as tool_span:
+                    try:
+                        tool_output = await tool_def.ainvoke(tool_args)
+                    except Exception as exc:
+                        span_log(tool_span, error=str(exc))
+                        span_log(tools_span, output={"error": "tool_execution_failed", "tool_name": tool_name})
+                        return _set_error(state, "tool_execution_failed")
 
-            if not isinstance(tool_output, str):
-                return _set_error(state, "tool_output_not_string")
+                    if not isinstance(tool_output, str):
+                        span_log(tool_span, output={"error": "tool_output_not_string"})
+                        span_log(tools_span, output={"error": "tool_output_not_string", "tool_name": tool_name})
+                        return _set_error(state, "tool_output_not_string")
 
-            tool_call_id = tool_call.get("id")
-            if not isinstance(tool_call_id, str) or not tool_call_id:
-                tool_call_id = f"call_{state['step']}_{i}"
+                    span_log(tool_span, output={"decision_json": _truncate_for_span_log(tool_output)})
 
-            tool_messages.append(
-                ToolMessage(
-                    content=tool_output,
-                    name=tool_name,
-                    tool_call_id=tool_call_id,
+                tool_call_id = tool_call.get("id")
+                if not isinstance(tool_call_id, str) or not tool_call_id:
+                    tool_call_id = f"call_{state['step']}_{i}"
+
+                tool_messages.append(
+                    ToolMessage(
+                        content=tool_output,
+                        name=tool_name,
+                        tool_call_id=tool_call_id,
+                    )
                 )
-            )
 
-            try:
-                decision = AgentDecision.model_validate_json(tool_output)
-            except Exception:
-                return _set_error(state, "invalid_tool_output")
+                try:
+                    decision = AgentDecision.model_validate_json(tool_output)
+                except Exception:
+                    span_log(tools_span, output={"error": "invalid_tool_output", "tool_name": tool_name})
+                    return _set_error(state, "invalid_tool_output")
 
-            observations.append(
-                await _capture_page_observation(
-                    runtime.page,
-                    fallback_url=fallback_url,
-                    fallback_title=fallback_title,
+                observations.append(
+                    await _capture_page_observation(
+                        runtime.page,
+                        fallback_url=fallback_url,
+                        fallback_title=fallback_title,
+                    )
                 )
-            )
+                span_log(tools_span, metadata={"last_action": decision.action, "tool_name": tool_name})
 
-            if decision.action in {"extract", "fail"}:
-                break
-            if decision.action in {"type_and_submit", "click", "navigate"} and i < (len(tool_calls) - 1):
-                # Replan after first state-changing action so subsequent decisions
-                # can use fresh page state instead of stale pre-action context.
-                break
+                if decision.action in {"extract", "fail"}:
+                    break
+                if decision.action in {"type_and_submit", "click", "navigate"} and i < (len(tool_calls) - 1):
+                    # Replan after first state-changing action so subsequent decisions
+                    # can use fresh page state instead of stale pre-action context.
+                    break
 
-        state["messages"] = tool_messages
-        state["action_observations"] = observations
-        return state
+            state["messages"] = tool_messages
+            state["action_observations"] = observations
+            span_log(tools_span, output={"tool_calls_executed": len(tool_messages)})
+            return state
 
     async def post_tool_node(state: AgentGraphState) -> AgentGraphState:
         if state["result"] is not None:
             return state
-        try:
-            page_state = state["page_state"]
-            if page_state is None:
-                raise ValueError("missing_page_state")
-            if not state["messages"]:
-                raise ValueError("missing_tool_messages")
-            observations = state.get("action_observations", [])
-            decisions = [
-                _decision_from_tool_message(message)
-                for message in state["messages"]
-                if isinstance(message, ToolMessage)
-            ]
-            if not decisions:
-                raise ValueError("missing_decisions")
-            if observations and len(observations) < len(decisions):
-                raise ValueError("missing_action_observations")
-        except Exception:
-            return _set_error(state, "invalid_tool_output")
+        with start_span(
+            name=f"post_tool.{state['step'] + 1}",
+            span_type="task",
+            metadata={"run_id": runtime.trace_id, "step": state["step"]},
+        ) as post_span:
+            try:
+                page_state = state["page_state"]
+                if page_state is None:
+                    raise ValueError("missing_page_state")
+                if not state["messages"]:
+                    raise ValueError("missing_tool_messages")
+                observations = state.get("action_observations", [])
+                decisions = [
+                    _decision_from_tool_message(message)
+                    for message in state["messages"]
+                    if isinstance(message, ToolMessage)
+                ]
+                if not decisions:
+                    raise ValueError("missing_decisions")
+                if observations and len(observations) < len(decisions):
+                    raise ValueError("missing_action_observations")
+            except Exception:
+                span_log(post_span, output={"error": "invalid_tool_output"})
+                return _set_error(state, "invalid_tool_output")
 
-        for index, decision in enumerate(decisions):
-            current_observation = (
-                observations[index]
-                if index < len(observations)
-                else await _capture_page_observation(
-                    runtime.page,
-                    fallback_url=page_state.url,
-                    fallback_title=page_state.title,
-                )
-            )
-            current_url = current_observation["url"]
-            current_title = current_observation["title"]
-
-            step_trace = AgentStepTrace(
-                step=len(state["trace"]),
-                url=current_url,
-                title=current_title,
-                decision=decision,
-            )
-            state["trace"] = state["trace"] + [step_trace]
-            if runtime.on_step:
-                runtime.on_step(step_trace)
-
-            if decision.action == "extract":
-                state["result"] = AgentResult(
-                    answer=decision.answer,
-                    structured_data=decision.structured_data,
-                    source_url=current_url,
-                    evidence=decision.evidence,
-                    confidence=decision.confidence,
-                    trace=state["trace"],
-                )
-                return state
-
-            if decision.action == "fail":
-                fallback_markdown = page_state.markdown
-                if runtime.extraction_schema:
-                    try:
-                        fallback_markdown = await page_to_markdown(
-                            runtime.page,
-                            selector=runtime.extraction_selector,
-                        )
-                    except Exception:
-                        fallback_markdown = page_state.markdown
-                fallback_decision = _schema_fallback_decision(
-                    extraction_schema=runtime.extraction_schema,
-                    markdown=fallback_markdown,
-                    fail_reason=decision.reason,
-                )
-                if fallback_decision is not None:
-                    fallback_trace = AgentStepTrace(
-                        step=len(state["trace"]),
-                        url=current_url,
-                        title=current_title,
-                        decision=fallback_decision,
+            for index, decision in enumerate(decisions):
+                span_log(post_span, metadata={"decision_index": index, "action": decision.action})
+                current_observation = (
+                    observations[index]
+                    if index < len(observations)
+                    else await _capture_page_observation(
+                        runtime.page,
+                        fallback_url=page_state.url,
+                        fallback_title=page_state.title,
                     )
-                    state["trace"] = state["trace"] + [fallback_trace]
-                    if runtime.on_step:
-                        runtime.on_step(fallback_trace)
+                )
+                current_url = current_observation["url"]
+                current_title = current_observation["title"]
 
+                step_trace = AgentStepTrace(
+                    step=len(state["trace"]),
+                    url=current_url,
+                    title=current_title,
+                    decision=decision,
+                )
+                state["trace"] = state["trace"] + [step_trace]
+                if runtime.on_step:
+                    runtime.on_step(step_trace)
+
+                if decision.action == "extract":
                     state["result"] = AgentResult(
-                        answer=fallback_decision.answer,
-                        structured_data=fallback_decision.structured_data,
+                        answer=decision.answer,
+                        structured_data=decision.structured_data,
                         source_url=current_url,
-                        evidence=fallback_decision.evidence,
-                        confidence=fallback_decision.confidence,
+                        evidence=decision.evidence,
+                        confidence=decision.confidence,
                         trace=state["trace"],
+                    )
+                    span_log(
+                        post_span,
+                        output={
+                            "result": "extract",
+                            "trace_steps": len(state["trace"]),
+                        },
                     )
                     return state
 
-                return _set_error(state, decision.reason or decision.next_step)
+                if decision.action == "fail":
+                    fallback_markdown = page_state.markdown
+                    if runtime.extraction_schema:
+                        try:
+                            fallback_markdown = await page_to_markdown(
+                                runtime.page,
+                                selector=runtime.extraction_selector,
+                            )
+                        except Exception:
+                            fallback_markdown = page_state.markdown
+                    fallback_decision = _schema_fallback_decision(
+                        extraction_schema=runtime.extraction_schema,
+                        markdown=fallback_markdown,
+                        fail_reason=decision.reason,
+                    )
+                    if fallback_decision is not None:
+                        fallback_trace = AgentStepTrace(
+                            step=len(state["trace"]),
+                            url=current_url,
+                            title=current_title,
+                            decision=fallback_decision,
+                        )
+                        state["trace"] = state["trace"] + [fallback_trace]
+                        if runtime.on_step:
+                            runtime.on_step(fallback_trace)
 
-        return _advance(state)
+                        state["result"] = AgentResult(
+                            answer=fallback_decision.answer,
+                            structured_data=fallback_decision.structured_data,
+                            source_url=current_url,
+                            evidence=fallback_decision.evidence,
+                            confidence=fallback_decision.confidence,
+                            trace=state["trace"],
+                        )
+                        span_log(
+                            post_span,
+                            output={
+                                "result": "fallback_extract",
+                                "trace_steps": len(state["trace"]),
+                            },
+                        )
+                        return state
+
+                    span_log(
+                        post_span,
+                        output={
+                            "result": "fail",
+                            "reason": decision.reason or decision.next_step,
+                        },
+                    )
+                    return _set_error(state, decision.reason or decision.next_step)
+
+            span_log(post_span, output={"result": "advance"})
+            return _advance(state)
 
     def route_after_post_tool(state: AgentGraphState) -> str:
         if state["result"] is not None:
@@ -1347,6 +1511,7 @@ async def run_agent(
     headless: bool = True,
     on_step: StepCallback | None = None,
     trace_id: str | None = None,
+    trace_parent: str | None = None,
 ) -> AgentResult:
     if max_actions_per_step < 1 or max_actions_per_step > 4:
         raise ValueError("max_actions_per_step must be between 1 and 4")
@@ -1357,36 +1522,79 @@ async def run_agent(
     if extraction_selector is not None and not normalized_extraction_selector:
         raise ValueError("extraction_selector_empty")
 
-    pw, browser, page = await run_browser(start_url, headless=headless)
     resolved_trace_id = trace_id or _new_trace_id()
-    runtime = _Runtime(
-        openrouter_client=openrouter_client,
-        page=page,
-        target_prompt=target_prompt,
-        max_steps=max_steps,
-        max_actions_per_step=max_actions_per_step,
-        extraction_schema=normalized_extraction_schema,
-        extraction_selector=normalized_extraction_selector,
-        on_step=on_step,
-        trace_id=resolved_trace_id,
-    )
-    graph = _build_graph(runtime)
-
-    initial_state: AgentGraphState = AgentGraphState(
-        step=0,
-        trace=[],
-        page_state=None,
-        result=None,
-        messages=[],
-        action_observations=[],
-    )
-
     try:
-        final_state = await graph.ainvoke(initial_state)
-        result = final_state.get("result")
-        if result is None:
-            return AgentResult(error="graph_finished_without_result", trace=final_state.get("trace", []))
-        return result
+        with start_span(
+            name="auto_browse_agent_run",
+            span_type="task",
+            parent=trace_parent,
+            metadata={
+                "run_id": resolved_trace_id,
+                "max_steps": max_steps,
+                "max_actions_per_step": max_actions_per_step,
+            },
+            input={
+                "start_url": start_url,
+                "target_prompt": target_prompt,
+                "headless": headless,
+                "extraction_schema_fields": sorted(normalized_extraction_schema.keys())
+                if normalized_extraction_schema
+                else None,
+                "extraction_selector": normalized_extraction_selector,
+            },
+            tags=[f"run_id:{resolved_trace_id}"],
+        ) as run_span:
+            pw, browser, page = await run_browser(start_url, headless=headless)
+            runtime = _Runtime(
+                openrouter_client=openrouter_client,
+                page=page,
+                target_prompt=target_prompt,
+                max_steps=max_steps,
+                max_actions_per_step=max_actions_per_step,
+                extraction_schema=normalized_extraction_schema,
+                extraction_selector=normalized_extraction_selector,
+                on_step=on_step,
+                trace_id=resolved_trace_id,
+            )
+            graph = _build_graph(runtime)
+
+            initial_state: AgentGraphState = AgentGraphState(
+                step=0,
+                trace=[],
+                page_state=None,
+                result=None,
+                messages=[],
+                action_observations=[],
+            )
+
+            try:
+                final_state = await graph.ainvoke(initial_state)
+                result = final_state.get("result")
+                if result is None:
+                    fallback_result = AgentResult(
+                        error="graph_finished_without_result",
+                        trace=final_state.get("trace", []),
+                    )
+                    span_log(
+                        run_span,
+                        output={
+                            "error": fallback_result.error,
+                            "trace_steps": len(fallback_result.trace),
+                        },
+                    )
+                    return fallback_result
+                span_log(
+                    run_span,
+                    output={
+                        "final_result": _result_for_root_span_log(result),
+                    },
+                )
+                return result
+            except Exception as exc:
+                span_log(run_span, error=str(exc))
+                raise
+            finally:
+                await browser.close()
+                await pw.stop()
     finally:
-        await browser.close()
-        await pw.stop()
+        flush_observability()
