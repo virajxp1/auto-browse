@@ -9,15 +9,23 @@ import math
 import os
 import statistics
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
-ALLOWED_ACTIONS = {"extract", "type_and_submit", "click", "navigate", "fail"}
+from agent.models import AgentDecision
+from agent.observability import export_current_span_parent
+
+ALLOWED_ACTIONS = frozenset(
+    str(action)
+    for action in get_args(AgentDecision.model_fields["action"].annotation)
+)
 DEFAULT_EVAL_CONFIG_PATH = "config/config.ini"
 DEFAULT_DATASET_NAME = "auto-browse-eval-cases"
 DEFAULT_MIN_OVERALL_SCORE = 0.75
 DEFAULT_AUTOEVALS_MODEL = "openai/gpt-4o-mini"
+DEFAULT_SCORER_TIMEOUT_SECONDS = 20
 
 COHERENCE_PROMPT = """\
 You are evaluating the coherence of an autonomous browser agent result.
@@ -41,8 +49,12 @@ class EvalTask:
     task_id: str
     start_url: str
     target_prompt: str
+    goal_type: str | None = None
+    task_data: dict[str, str] | None = None
+    sensitive_data: dict[str, str] | None = None
     max_steps: int = 10
     max_actions_per_step: int = 1
+    max_runtime_seconds: int = 90
     extraction_schema: dict[str, str] | None = None
     extraction_selector: str | None = None
     expected_contains: list[str] | None = None
@@ -50,8 +62,6 @@ class EvalTask:
     required_actions: list[str] | None = None
 
     def is_complex(self) -> bool:
-        if self.max_actions_per_step > 1:
-            return True
         if self.required_actions:
             return True
         if self.min_trace_steps is not None and self.min_trace_steps > 1:
@@ -72,8 +82,39 @@ class EvalTask:
         if not target_prompt:
             raise ValueError(f"Task '{task_id}' is missing non-empty 'target_prompt'")
 
+        goal_type_raw = payload.get("goal_type")
+        goal_type = str(goal_type_raw).strip() if goal_type_raw is not None else None
+        if goal_type_raw is not None and not goal_type:
+            raise ValueError(f"Task '{task_id}' has empty goal_type")
+
         max_steps = int(payload.get("max_steps", 10))
         max_actions_per_step = int(payload.get("max_actions_per_step", 1))
+        max_runtime_seconds = int(payload.get("max_runtime_seconds", 90))
+        if max_actions_per_step < 1:
+            raise ValueError(f"Task '{task_id}' max_actions_per_step must be at least 1")
+        max_actions_per_step = 1
+        if max_runtime_seconds < 1:
+            raise ValueError(f"Task '{task_id}' max_runtime_seconds must be at least 1")
+
+        def _normalize_string_map(field_name: str) -> dict[str, str] | None:
+            raw_value = payload.get(field_name)
+            if raw_value is None:
+                return None
+            if not isinstance(raw_value, dict):
+                raise ValueError(f"Task '{task_id}' {field_name} must be an object")
+            normalized: dict[str, str] = {}
+            for key, value in raw_value.items():
+                normalized_key = str(key).strip()
+                normalized_value = str(value).strip()
+                if not normalized_key:
+                    raise ValueError(f"Task '{task_id}' has empty {field_name} key")
+                if not normalized_value:
+                    raise ValueError(f"Task '{task_id}' has empty {field_name} value for '{normalized_key}'")
+                normalized[normalized_key] = normalized_value
+            return normalized or None
+
+        task_data = _normalize_string_map("task_data")
+        sensitive_data = _normalize_string_map("sensitive_data")
 
         extraction_schema_raw = payload.get("extraction_schema")
         extraction_schema: dict[str, str] | None = None
@@ -135,8 +176,12 @@ class EvalTask:
             task_id=task_id,
             start_url=start_url,
             target_prompt=target_prompt,
+            goal_type=goal_type,
+            task_data=task_data,
+            sensitive_data=sensitive_data,
             max_steps=max_steps,
             max_actions_per_step=max_actions_per_step,
+            max_runtime_seconds=max_runtime_seconds,
             extraction_schema=extraction_schema,
             extraction_selector=extraction_selector,
             expected_contains=expected_contains,
@@ -210,6 +255,9 @@ def _read_braintrust_settings(path: Path) -> dict[str, str | None]:
 
 def _result_text(record: dict[str, Any]) -> str:
     parts = [
+        record.get("status") or "",
+        record.get("goal_summary") or "",
+        json.dumps(record.get("result_data") or {}, sort_keys=True),
         record.get("answer") or "",
         record.get("evidence") or "",
         json.dumps(record.get("structured_data") or {}, sort_keys=True),
@@ -276,7 +324,16 @@ def _normalize_dataset_case(raw: dict[str, Any]) -> dict[str, Any] | None:
 
 def _fetch_eval_cases_from_dataset(dataset: Any, *, limit: int) -> list[dict[str, Any]]:
     cases: list[dict[str, Any]] = []
-    for raw in dataset.fetch():
+    raw_records = list(dataset.fetch())
+    if not raw_records:
+        fetched_data = None
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            fetched_data = getattr(dataset, "fetched_data", None)
+        if isinstance(fetched_data, list):
+            raw_records = fetched_data
+
+    for raw in raw_records:
         if not isinstance(raw, dict):
             continue
         normalized = _normalize_dataset_case(raw)
@@ -312,6 +369,42 @@ def _reference_text_from_expected(input_payload: Any, expected_payload: Any) -> 
                 return joined
 
     return None
+
+
+def _summarize_error(error: Exception, *, limit: int = 160) -> str:
+    message = str(error).strip() or error.__class__.__name__
+    detail = f"{error.__class__.__name__}: {message}"
+    if len(detail) > limit:
+        return f"{detail[: limit - 3]}..."
+    return detail
+
+
+async def _score_with_timeout(
+    *,
+    name: str,
+    coro: Any,
+    timeout_seconds: int = DEFAULT_SCORER_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    try:
+        score = await asyncio.wait_for(coro, timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        return {
+            "name": name,
+            "score": 0.0,
+            "metadata": {"reason": "scorer_timed_out", "timeout_seconds": timeout_seconds},
+        }
+    except Exception as exc:
+        return {
+            "name": name,
+            "score": 0.0,
+            "metadata": {"reason": "scorer_failed", "detail": _summarize_error(exc)},
+        }
+
+    return {
+        "name": name,
+        "score": score.score,
+        "metadata": score.metadata,
+    }
 
 
 def _resolve_autoevals_settings(*, configured_model: str) -> dict[str, str | None]:
@@ -379,6 +472,7 @@ def _percentile(values: list[float], percentile: float) -> float | None:
 def _normalize_record(record: dict[str, Any], *, total_repeats: int) -> dict[str, Any]:
     normalized = {
         "task_id": str(record.get("task_id") or "unknown_task"),
+        "trace_id": record.get("trace_id"),
         "repeat": int(record.get("repeat") or 1),
         "total_repeats": int(record.get("total_repeats") or total_repeats),
         "is_complex": bool(record.get("is_complex")),
@@ -387,10 +481,15 @@ def _normalize_record(record: dict[str, Any], *, total_repeats: int) -> dict[str
         "duration_s": round(float(record.get("duration_s") or 0.0), 4),
         "trace_steps": int(record.get("trace_steps") or 0),
         "actions": [str(action) for action in (record.get("actions") or [])],
+        "status": record.get("status"),
+        "goal_summary": record.get("goal_summary"),
+        "result_data": record.get("result_data"),
         "answer": record.get("answer"),
         "structured_data": record.get("structured_data"),
         "evidence": record.get("evidence"),
         "source_url": record.get("source_url"),
+        "final_url": record.get("final_url"),
+        "final_title": record.get("final_title"),
     }
     if "http_status" in record:
         normalized["http_status"] = record.get("http_status")
@@ -405,6 +504,7 @@ def _set_hook_metadata(hooks: Any, task: EvalTask, record: dict[str, Any]) -> No
         metadata.update(
             {
                 "task_id": task.task_id,
+                "trace_id": record.get("trace_id"),
                 "repeat": int(record.get("repeat") or 1),
                 "total_repeats": int(record.get("total_repeats") or 1),
                 "is_complex": bool(record.get("is_complex")),
@@ -424,6 +524,7 @@ def _set_hook_metadata(hooks: Any, task: EvalTask, record: dict[str, Any]) -> No
 def _initial_task_record(task: EvalTask, *, repeat_index: int, total_repeats: int) -> dict[str, Any]:
     return {
         "task_id": task.task_id,
+        "trace_id": _eval_trace_id(task.task_id, repeat_index),
         "repeat": repeat_index + 1,
         "total_repeats": total_repeats,
         "is_complex": task.is_complex(),
@@ -432,10 +533,15 @@ def _initial_task_record(task: EvalTask, *, repeat_index: int, total_repeats: in
         "duration_s": 0.0,
         "trace_steps": 0,
         "actions": [],
+        "status": None,
+        "goal_summary": None,
+        "result_data": None,
         "answer": None,
         "structured_data": None,
         "evidence": None,
         "source_url": None,
+        "final_url": None,
+        "final_title": None,
     }
 
 
@@ -460,6 +566,10 @@ def _zero_score_error_handler(_span: Any, _datum: Any, unhandled_scores: list[st
     return {str(score_name): 0.0 for score_name in unhandled_scores}
 
 
+def _eval_trace_id(task_id: str, repeat_index: int) -> str:
+    return f"eval:{task_id}:repeat:{repeat_index + 1}"
+
+
 def _record_from_eval_result(result: Any, *, total_repeats: int) -> dict[str, Any]:
     output = getattr(result, "output", None)
     if isinstance(output, dict):
@@ -476,6 +586,7 @@ def _record_from_eval_result(result: Any, *, total_repeats: int) -> dict[str, An
         task_id = str(metadata.get("task_id") or input_payload.get("id") or "unknown_task")
         record = {
             "task_id": task_id,
+            "trace_id": metadata.get("trace_id"),
             "repeat": repeat,
             "total_repeats": int(metadata.get("total_repeats") or total_repeats),
             "is_complex": bool(metadata.get("is_complex")),
@@ -484,10 +595,15 @@ def _record_from_eval_result(result: Any, *, total_repeats: int) -> dict[str, An
             "duration_s": 0.0,
             "trace_steps": 0,
             "actions": [],
+            "status": None,
+            "goal_summary": None,
+            "result_data": None,
             "answer": None,
             "structured_data": None,
             "evidence": None,
             "source_url": None,
+            "final_url": None,
+            "final_title": None,
         }
 
     err = getattr(result, "error", None)
@@ -518,20 +634,77 @@ async def _run_single(
     from agent.run import run_agent
 
     started = time.perf_counter()
-    result = await run_agent(
-        client,
-        start_url=task.start_url,
-        target_prompt=task.target_prompt,
-        max_steps=task.max_steps,
-        max_actions_per_step=task.max_actions_per_step,
-        extraction_schema=task.extraction_schema,
-        extraction_selector=task.extraction_selector,
-        headless=True,
-    )
+    trace_id = _eval_trace_id(task.task_id, repeat_index)
+    trace_parent = export_current_span_parent()
+    try:
+        result = await run_agent(
+            client,
+            start_url=task.start_url,
+            target_prompt=task.target_prompt,
+            goal_type=task.goal_type,
+            task_data=task.task_data,
+            sensitive_data=task.sensitive_data,
+            max_steps=task.max_steps,
+            max_actions_per_step=task.max_actions_per_step,
+            max_runtime_seconds=task.max_runtime_seconds,
+            extraction_schema=task.extraction_schema,
+            extraction_selector=task.extraction_selector,
+            headless=True,
+            trace_id=trace_id,
+            trace_parent=trace_parent,
+        )
+    except asyncio.TimeoutError:
+        duration_s = time.perf_counter() - started
+        return {
+            "task_id": task.task_id,
+            "trace_id": trace_id,
+            "repeat": repeat_index + 1,
+            "total_repeats": total_repeats,
+            "is_complex": task.is_complex(),
+            "success": False,
+            "error": "run_timed_out",
+            "duration_s": round(duration_s, 4),
+            "trace_steps": 0,
+            "actions": [],
+            "status": None,
+            "goal_summary": None,
+            "result_data": None,
+            "answer": None,
+            "structured_data": None,
+            "evidence": None,
+            "source_url": None,
+            "final_url": None,
+            "final_title": None,
+        }
+    except Exception as exc:
+        duration_s = time.perf_counter() - started
+        return {
+            "task_id": task.task_id,
+            "trace_id": trace_id,
+            "repeat": repeat_index + 1,
+            "total_repeats": total_repeats,
+            "is_complex": task.is_complex(),
+            "success": False,
+            "error": f"task_exception:{type(exc).__name__}",
+            "duration_s": round(duration_s, 4),
+            "trace_steps": 0,
+            "actions": [],
+            "status": None,
+            "goal_summary": None,
+            "result_data": None,
+            "answer": None,
+            "structured_data": None,
+            "evidence": None,
+            "source_url": None,
+            "final_url": None,
+            "final_title": None,
+        }
+
     duration_s = time.perf_counter() - started
 
     record = {
         "task_id": task.task_id,
+        "trace_id": trace_id,
         "repeat": repeat_index + 1,
         "total_repeats": total_repeats,
         "is_complex": task.is_complex(),
@@ -540,10 +713,15 @@ async def _run_single(
         "duration_s": round(duration_s, 4),
         "trace_steps": len(result.trace),
         "actions": [item.decision.action for item in result.trace],
+        "status": result.status,
+        "goal_summary": result.goal_summary,
+        "result_data": result.result_data,
         "answer": result.answer,
         "structured_data": result.structured_data,
         "evidence": result.evidence,
         "source_url": result.source_url,
+        "final_url": result.final_url,
+        "final_title": result.final_title,
     }
 
     expectation_failure = _first_expectation_failure(record, task) if record["success"] else None
@@ -642,8 +820,10 @@ async def _run_eval(
         if isinstance(input, dict):
             input_text = str(input.get("target_prompt") or input.get("id") or "")
 
-        score = await coherence_scorer.eval_async(output=output_text, input=input_text)
-        return {"name": "coherence", "score": score.score, "metadata": score.metadata}
+        return await _score_with_timeout(
+            name="coherence",
+            coro=coherence_scorer.eval_async(output=output_text, input=input_text),
+        )
 
     async def score_factuality(input: Any, output: Any, expected: Any = None, **kwargs: Any) -> dict[str, Any]:
         _ = kwargs
@@ -655,8 +835,10 @@ async def _run_eval(
         if not reference_text:
             return {"name": "factuality", "score": None, "metadata": {"reason": "missing_reference"}}
 
-        score = await factuality_scorer.eval_async(output=output_text, expected=reference_text)
-        return {"name": "factuality", "score": score.score, "metadata": score.metadata}
+        return await _score_with_timeout(
+            name="factuality",
+            coro=factuality_scorer.eval_async(output=output_text, expected=reference_text),
+        )
 
     result = await EvalAsync(
         name=braintrust_project,

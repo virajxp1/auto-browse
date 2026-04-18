@@ -1,13 +1,14 @@
 # Auto Browse MVP
 
-Minimal constrained browser agent:
+Constrained browser agent for discrete web tasks:
 
-1. Load page with Playwright.
-2. Convert HTML to readable markdown (readability + markdownify).
+1. Start a Playwright browser session and capture a page snapshot.
+2. Build a cached page state with URL, title, markdown, interactables, and grounded refs.
 3. Orchestrate the loop as a LangGraph state machine.
-4. Ask an LLM for one or more tool calls each turn (configurable budget).
-5. Execute those tools with a LangGraph tool-execution node (`extract_answer`, `type_and_submit`, `click`, `navigate`, `fail`).
-6. Repeat until answer or failure.
+4. Take exactly one typed browser action per step.
+5. Use grounded shortcuts plus a planner LLM to choose the next action.
+6. Use Deep Agents as an analysis/verifier layer for ambiguous pages and goal completion checks.
+7. Repeat until answer, verified completion, or failure.
 
 At every step, the API logs:
 
@@ -65,7 +66,7 @@ curl -X POST "http://127.0.0.1:8000/run" \
     "start_url": "https://www.google.com",
     "target_prompt": "release date of Star Wars",
     "max_steps": 10,
-    "max_actions_per_step": 2
+    "max_actions_per_step": 1
   }'
 ```
 
@@ -89,7 +90,13 @@ Notes:
 - `start_url` accepts either a full URL (`https://...`) or a hostname (`www.google.com`), which is auto-normalized to `https://...`.
 - The API always logs intermediary step summaries and next actions.
 - `/run` enforces a cooldown of 1 accepted request every 20 seconds (HTTP `429` with `Retry-After` when exceeded).
-- `max_actions_per_step` controls how many tool calls the model may emit in one turn (`1..4`).
+- `max_actions_per_step` is currently fixed to `1`.
+- `max_runtime_seconds` caps total wall-clock runtime for the whole agent run (default `90`).
+- Optional goal-oriented fields:
+  - `goal_type`: high-level mode such as `generic`, `search`, `signup`, or `extract`
+  - `task_data`: non-secret task inputs like `{ "city": "Madrid", "guests": "2" }`
+  - `sensitive_data`: secret inputs like passwords; these are redacted in request logs
+  - Generic goal completion now supports a verifier step via `verify_goal`, and `complete_goal` is expected only after success has been checked on the current page.
 - Optional schema extraction:
   - `extraction_schema`: `{ "field_name": "field description" }`
   - `extraction_selector`: optional Playwright selector to scope extraction to a DOM subtree.
@@ -98,8 +105,8 @@ Notes:
 - Braintrust runtime traces are enabled when:
   - `BRAINTRUST_API_KEY` is set, and
   - `[braintrust].project_id` is set in `config/config.ini`.
-  - Each run creates one root span: `auto_browse_agent_run`.
-  - Child spans are emitted for `capture.N`, `planner.N`, `execute_tools.N`/`tool.*`, and `post_tool.N`.
+  - Each run creates one root span: `agent.run`.
+  - Child spans are emitted for `startup.browser`, `capture.N`, `llm.N`, `execute_tools.N`/`tool.*`, and `post_tool.N`.
   - Root span metadata includes `run_id`, matching the internal OpenRouter `trace_id`.
 - Each run sends OpenRouter tracing metadata on every LLM step:
   - `trace.trace_id` is generated automatically (UUIDv7 fallback to UUID4).
@@ -150,7 +157,7 @@ curl -X POST "https://<your-render-url>/run" \
     "start_url": "https://www.google.com",
     "target_prompt": "release date of Star Wars",
     "max_steps": 10,
-    "max_actions_per_step": 2
+    "max_actions_per_step": 1
   }'
 ```
 ## Use In Other Projects
@@ -181,8 +188,10 @@ async def main() -> None:
         client,
         start_url="https://www.google.com",
         target_prompt="release date of Star Wars",
+        goal_type="extract",
         max_steps=10,
-        max_actions_per_step=2,
+        max_actions_per_step=1,
+        max_runtime_seconds=90,
         headless=True,
     )
     print(result.model_dump())
@@ -195,12 +204,39 @@ asyncio.run(main())
 
 The `/run` response body contains:
 
+- `status`
+- `goal_summary`
+- `result_data`
 - `answer`
 - `structured_data` (present when schema extraction is used)
 - `source_url`
+- `final_url`
+- `final_title`
 - `evidence`
 - `confidence`
 - `trace` (step-by-step decisions)
+
+## Runtime Architecture
+
+The current runtime is organized around a few core pieces:
+
+- `agent/run.py`: LangGraph execution loop, typed tool handlers, grounded shortcuts, planner fallback, and Braintrust span emission.
+- `agent/snapshot.py`: page snapshot capture, caching, invalidation, and fallback capture paths.
+- `agent/browser.py`: Playwright startup plus interactable extraction and ref assignment.
+- `agent/planner.py`: planner prompt + tool-call message construction.
+- `agent/deep_advisor.py`: Deep Agents-backed page analysis and goal verification.
+- `agent/task_intent.py`: generic search/result progression hints used before planner invocation.
+
+Behavior notes:
+
+- The planner no longer executes multiple tools in one turn. Each step resolves to one tool call.
+- Interactables are exposed with stable `interactable_ref` values, and planner/runtime prefer refs over invented selectors.
+- The runtime can skip the main planner LLM call when a grounded shortcut is obvious from the current snapshot, for example:
+  - submitting a visible site search field
+  - opening the strongest visible result link
+  - applying the latest page analysis result directly
+- Snapshot capture is cached per page state and invalidated after actions that change the page.
+- `analyze_page` and `verify_goal` are part of the runtime loop, not external manual utilities.
 
 ## Tests
 
@@ -248,45 +284,31 @@ Task schema supports optional behavior assertions:
 
 ## Documented Successes and Failures (Observed)
 
-The following results were observed in API eval runs on **February 23, 2026**.
-They are run logs from this repo's current implementation, not permanent guarantees.
+The following are point-in-time eval results from this repo's current implementation, not permanent guarantees.
 
-### Complex Suite (`evals/tasks_complex.json`, Google-start)
+### Braintrust Dataset Runs
 
-- Full run report: `.context/eval_report_google_start_complex_api_full.json`
-- Result: **8/10 passed** (`80%` success, `repeats=1`, API mode).
-- Step behavior in successful runs:
-  - `median_steps_success = 2`
-  - Multi-step examples include `type_and_submit + click + extract` and `navigate + extract`.
-- Successful examples:
-  - `ddg_search_openai_docs_title` -> `type_and_submit + click + extract` -> `OpenAI API Platform Documentation`
-  - `ddg_search_python_wiki_title` -> `type_and_submit + click + extract` -> `Python (programming language)`
-  - `navigate_then_schema_star_wars` -> `navigate + extract` with structured infobox fields
-  - `schema_python_infobox` -> structured extraction (`designer`, `first_appeared`)
-- Failures in this run:
-  - `example_click_to_iana_title` -> `click_failed`
-  - `wikipedia_search_un_title` -> `max_steps_exceeded` after repeated navigation/click attempts
+Representative Braintrust-rooted reports:
 
-### Fresh-State Fix Sanity Slice (first 5 complex tasks)
+- `.context/eval_report_full_expanded_suite_braintrust_2026-03-30.json`
+- `.context/eval_report_full_expanded_suite_braintrust_2026-04-04_after_anchor_enrichment.json`
 
-- Report: `.context/eval_report_google_start_complex_limit5_after_fresh_state_fix.json`
-- Result: **4/5 passed** (`80%` success, API mode).
-- Shows stable passes on:
-  - direct navigation tasks
-  - Google search + click workflows
-- Remaining miss in this slice:
-  - `example_click_to_iana_title` (still unreliable on click-driven transition)
+Recent observed broad-suite behavior on **April 4, 2026**:
+
+- Best full Braintrust run in the current iteration: `15/21`, `overall_score=0.7048`
+- Results are still stochastic across heavier search/docs/retail sites
+- Current main gaps are search-driven progression and first-turn reliability on some JS-heavy pages
 
 ### What This Means
 
-- The agent now handles substantially more multi-step tasks than earlier runs, including search-driven flows.
-- The remaining primary gap is robust click-driven progression on some pages, which is the highest-value next reliability target.
+- Eval source of truth is the Braintrust dataset, not committed JSON fixtures.
+- The main quality gap is no longer generic extraction; it is reliable multi-step progression on search-heavy and JS-heavy sites.
 
 ## Notes
 
 - This MVP intentionally constrains the action space to reduce hallucinated browser operations.
 - Orchestration is implemented with LangGraph state nodes instead of a manual `for` loop.
-- The LLM makes navigation decisions directly; the runtime does not auto-rewrite actions.
+- The runtime may short-circuit the planner with grounded next-step actions when the current snapshot makes the move obvious.
 - Use a Python version within the configured range (`>=3.11,<3.15`).
 
 ## License

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from agent.extract import html_to_markdown, page_to_markdown
 
@@ -37,6 +38,28 @@ class ExtractMarkdownTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("George Lucas", markdown)
         self.assertIn("Gary Kurtz", markdown)
+
+    def test_html_to_markdown_prefers_raw_content_when_readability_strips_price(self) -> None:
+        html = (
+            "<html><head><title>Buy iPhone 17 - Apple</title></head>"
+            "<body><main><h1>Buy iPhone 17</h1><p>From $799</p><button>Buy</button></main></body></html>"
+        )
+
+        class _StubDocument:
+            def __init__(self, _html: str) -> None:
+                return None
+
+            def summary(self, **_kwargs) -> str:
+                return "<article><h1>Buy iPhone 17</h1><p>Choose your finish</p></article>"
+
+            def short_title(self) -> str:
+                return "Buy iPhone 17 - Apple"
+
+        with patch("agent.extract.Document", _StubDocument):
+            markdown = html_to_markdown(html, prefer_readability=True)
+
+        self.assertIn("$799", markdown)
+        self.assertIn("Buy", markdown)
 
     async def test_page_to_markdown_keeps_scoped_table_content(self) -> None:
         page = _StubPage()
