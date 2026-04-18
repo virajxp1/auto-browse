@@ -35,7 +35,7 @@ def update_scratchpad(scratchpad: AgentScratchpad, step: AgentStepTrace) -> Agen
     # Track fill/type_and_submit fields
     if action in {"fill", "type_and_submit"}:
         selector = decision.selector or decision.interactable_ref or ""
-        value = decision.value or ""
+        value = decision.text or decision.value or ""
         if selector and value:
             entry = f"{selector}={value[:40]}"
             if entry not in filled_fields:

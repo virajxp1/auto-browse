@@ -80,8 +80,8 @@ class BrowserCaptureResilienceTest(unittest.IsolatedAsyncioTestCase):
             fallback="css=button >> nth=0",
         )
 
-        # Two DOM matches, one visible (index 1) → disambiguated :nth-match selector
-        self.assertEqual(selector, ':nth-match(css=button[aria-label="Search"], 2)')
+        # Two DOM matches, one visible (index 1) → engine prefix stripped before :nth-match
+        self.assertEqual(selector, ':nth-match(button[aria-label="Search"], 2)')
 
     async def test_builder_failure_does_not_skip_other_interactables(self) -> None:
         button = Interactable(kind="button", label="Submit", selector="css=button >> nth=0")

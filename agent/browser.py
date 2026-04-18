@@ -77,9 +77,10 @@ async def _first_unique_selector(page: Page, candidates: list[str | None], fallb
                 except Exception:
                     continue
             if visible_index is not None:
-                # Disambiguate with :nth-match so downstream actions hit the
-                # correct node even if DOM visibility changes later.
-                return f":nth-match({candidate}, {visible_index + 1})"
+                # :nth-match requires a plain CSS selector — strip any Playwright
+                # engine prefix (css=, role=, text=, etc.) before wrapping.
+                css_candidate = re.sub(r"^[a-z]+=", "", candidate)
+                return f":nth-match({css_candidate}, {visible_index + 1})"
     return fallback
 
 
