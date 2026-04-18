@@ -92,7 +92,8 @@ class EvalTask:
         max_runtime_seconds = int(payload.get("max_runtime_seconds", 90))
         if max_actions_per_step < 1:
             raise ValueError(f"Task '{task_id}' max_actions_per_step must be at least 1")
-        max_actions_per_step = 1
+        if max_actions_per_step > 3:
+            raise ValueError(f"Task '{task_id}' max_actions_per_step must be at most 3")
         if max_runtime_seconds < 1:
             raise ValueError(f"Task '{task_id}' max_runtime_seconds must be at least 1")
 

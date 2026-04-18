@@ -66,17 +66,20 @@ async def _first_unique_selector(page: Page, candidates: list[str | None], fallb
         if len(matches) == 1:
             return candidate
         if len(matches) > 1:
-            visible_matches = 0
-            for handle in matches:
+            visible_index: int | None = None
+            for idx, handle in enumerate(matches):
                 try:
                     if await _is_visible(handle):
-                        visible_matches += 1
+                        if visible_index is not None:
+                            visible_index = None
+                            break
+                        visible_index = idx
                 except Exception:
                     continue
-                if visible_matches > 1:
-                    break
-            if visible_matches == 1:
-                return candidate
+            if visible_index is not None:
+                # Disambiguate with :nth-match so downstream actions hit the
+                # correct node even if DOM visibility changes later.
+                return f":nth-match({candidate}, {visible_index + 1})"
     return fallback
 
 

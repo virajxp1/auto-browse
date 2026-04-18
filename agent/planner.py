@@ -248,6 +248,7 @@ def build_prompt(
     extraction_selector: str | None = None,
     budget: ContextBudget | None = None,
     working_memory: str | None = None,
+    max_actions_per_step: int = 1,
 ) -> str:
     resolved_budget = budget or compute_context_budget(
         state,
@@ -313,7 +314,10 @@ def build_prompt(
         )
 
     extraction_scope_text = extraction_selector or "none"
-    action_budget_text = "exactly one tool"
+    if max_actions_per_step <= 1:
+        action_budget_text = "exactly one tool"
+    else:
+        action_budget_text = f"up to {max_actions_per_step} tools in order"
 
     working_memory_text = working_memory or "none"
 
@@ -404,6 +408,7 @@ def build_llm_messages(
                 extraction_selector=extraction_selector,
                 budget=budget,
                 working_memory=working_memory,
+                max_actions_per_step=max_actions_per_step,
             )
         ),
     ]
