@@ -17,7 +17,7 @@ except Exception:  # pragma: no cover - dependency import guard
 
 
 class _NoopSpan:
-    def log(self, **event: Any) -> None:
+    def log(self, **_event: Any) -> None:
         return None
 
     def export(self) -> str:

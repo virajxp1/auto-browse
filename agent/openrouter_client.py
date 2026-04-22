@@ -3,6 +3,7 @@ from __future__ import annotations
 import configparser
 import os
 from dataclasses import dataclass
+from functools import cached_property
 from importlib.resources import files
 from pathlib import Path
 
@@ -113,10 +114,14 @@ class OpenRouterClient:
         model_name = _resolve_openrouter_model_name()
         return cls(api_key=api_key, model_name=model_name)
 
-    def chat_model(self) -> ChatOpenAI:
+    @cached_property
+    def _chat_model(self) -> ChatOpenAI:
         return ChatOpenAI(
             model=self.model_name,
             api_key=self.api_key,
             base_url="https://openrouter.ai/api/v1",
             temperature=0,
         )
+
+    def chat_model(self) -> ChatOpenAI:
+        return self._chat_model

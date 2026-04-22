@@ -1,73 +1,110 @@
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
 import re
 import uuid
-from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, TypedDict
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Mapping, TypedDict
+from urllib.parse import urljoin, urlsplit
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.graph import END, START, StateGraph
 from playwright.async_api import Page
-from pydantic import BaseModel, ConfigDict, Field
 
-from agent.browser import capture_state, run_browser
+from agent.browser import capture_state, goto_with_fallback, run_browser
+from agent.browser_actions import (
+    FALLBACK_SELECTOR_WAIT_MS,
+    PRIMARY_SELECTOR_WAIT_MS,
+    check_fallback_selectors,
+    click_fallback_selectors,
+    click_single_visible_link,
+    click_via_css_fallback,
+    click_via_text_heuristic,
+    extract_selector_hint,
+    selector_has_selected_value,
+    selector_is_checked,
+    selector_value_matches,
+    select_fallback_selectors,
+    try_check_selector,
+    try_click_selector,
+    try_fill_selector,
+    try_select_option_selector,
+    try_submit_selector,
+    try_type_and_submit_selector,
+    try_wait_for_selector,
+    type_and_submit_via_text_heuristic,
+    type_fallback_selectors,
+    wait_for_action_effect,
+    wait_short,
+)
+from agent.deep_advisor import (
+    analyze_page_with_deep_agents,
+    fallback_page_analysis,
+    verify_goal_with_deep_agents,
+)
 from agent.extract import page_to_markdown
-from agent.models import AgentDecision, AgentResult, AgentStepTrace, PageState
-from agent.observability import span_log, start_span
+from agent.models import AgentDecision, AgentResult, AgentStepTrace, Interactable, PageState
+from agent.observability import export_current_span_parent, flush, span_log, start_span
 from agent.openrouter_client import OpenRouterClient
+from agent.context_budget import compute_context_budget
+from agent.memory import AgentScratchpad, format_scratchpad, update_scratchpad
 from agent.planner import build_llm_messages
+from agent.snapshot import PageSnapshotService, budget_page_state, capture_dom_signature
+from agent.task_intent import (
+    best_result_link,
+    extract_task_query,
+    is_search_like_input,
+    page_identity_matches_query,
+    page_matches_query,
+    query_tokens,
+    search_progress_state,
+    task_requires_destination_page,
+)
+from agent.tool_args import (
+    AnalyzePageArgs,
+    CheckArgs,
+    ClickArgs,
+    CompleteGoalArgs,
+    ExtractAnswerArgs,
+    FailArgs,
+    FillArgs,
+    NavigateArgs,
+    SelectOptionArgs,
+    SubmitArgs,
+    TypeAndSubmitArgs,
+    VerifyGoalArgs,
+    WaitForArgs,
+)
 
 StepCallback = Callable[[AgentStepTrace], None]
-
-
-class _StrictArgs(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-
-class _StepArgs(_StrictArgs):
-    step_summary: str
-    next_step: str
-
-
-class _SelectorStepArgs(_StepArgs):
-    selector: str
-
-
-class TypeAndSubmitArgs(_SelectorStepArgs):
-    text: str
-
-
-class ClickArgs(_SelectorStepArgs):
-    pass
-
-
-class NavigateArgs(_StepArgs):
-    url: str
-
-
-class ExtractAnswerArgs(_StepArgs):
-    answer: str | None = None
-    structured_data: dict[str, str | None] | None = None
-    evidence: str
-    confidence: float | None = Field(default=None, ge=0, le=1)
-
-
-class FailArgs(_StepArgs):
-    reason: str
-
+_SNAPSHOT_CAPTURE_TIMEOUT_SECONDS = 15.0
+_DEEP_ADVISOR_TIMEOUT_SECONDS = 12.0
+_LLM_CALL_TIMEOUT_SECONDS = 20.0
+_SMALL_TARGET_TOKEN_SET_SIZE = 2
 
 @dataclass
 class _Runtime:
     openrouter_client: OpenRouterClient
     page: Page
+    snapshot_service: PageSnapshotService
+    start_url: str
     target_prompt: str
+    goal_type: str | None
+    task_data: Mapping[str, str] | None
+    sensitive_data: Mapping[str, str] | None
     max_steps: int
     max_actions_per_step: int
     extraction_schema: dict[str, str] | None
     extraction_selector: str | None
     on_step: StepCallback | None
     trace_id: str
+    current_trace: list[AgentStepTrace] = field(default_factory=list)
+    current_page_state: PageState | None = None
+    last_verification_passed: bool | None = None
+    last_verification_url: str | None = None
+    scratchpad: AgentScratchpad = field(default_factory=AgentScratchpad)
 
 
 class ActionObservation(TypedDict):
@@ -85,7 +122,7 @@ class AgentGraphState(TypedDict):
 
 
 def _set_error(state: AgentGraphState, error: str) -> AgentGraphState:
-    state["result"] = AgentResult(error=error, trace=state["trace"])
+    state["result"] = AgentResult(status="failed", error=error, trace=state["trace"])
     return state
 
 
@@ -98,10 +135,8 @@ def _advance(state: AgentGraphState) -> AgentGraphState:
 
 
 async def _wait_domcontentloaded(page: Page, timeout: int = 10000) -> None:
-    try:
+    with suppress(Exception):
         await page.wait_for_load_state("domcontentloaded", timeout=timeout)
-    except Exception:
-        pass
 
 
 async def _capture_page_observation(
@@ -121,113 +156,137 @@ async def _capture_page_observation(
     return {"url": current_url, "title": current_title}
 
 
-async def _capture_action_snapshot(page: Page) -> tuple[str, str, str]:
-    url = page.url or ""
-
-    title = ""
-    title_fn = getattr(page, "title", None)
-    if callable(title_fn):
-        try:
-            title = await title_fn()
-        except Exception:
-            title = ""
-
-    dom_signature = ""
-    evaluate_fn = getattr(page, "evaluate", None)
-    if callable(evaluate_fn):
-        try:
-            signature = await evaluate_fn(
-                """() => {
-                    const body = document.body;
-                    if (!body) return "";
-                    const text = (body.innerText || body.textContent || "")
-                      .replace(/\\s+/g, " ")
-                      .trim()
-                      .slice(0, 1200);
-                    const count = document.querySelectorAll("a,button,input,textarea,select,form").length;
-                    return `${count}|${text}`;
-                }"""
-            )
-            dom_signature = str(signature or "")
-        except Exception:
-            dom_signature = ""
-
-    return (url, title, dom_signature)
-
-
-def _snapshot_changed(before: tuple[str, str, str], after: tuple[str, str, str]) -> bool:
-    return before != after
-
-
-async def _wait_for_action_effect(
-    page: Page,
-    before_snapshot: tuple[str, str, str],
-    *,
-    retries: int = 3,
-    delay_ms: int = 300,
-) -> bool:
-    wait_timeout_fn = getattr(page, "wait_for_timeout", None)
-    if not callable(wait_timeout_fn):
-        return False
-
-    for _ in range(retries):
-        try:
-            await wait_timeout_fn(delay_ms)
-        except Exception:
-            return False
-
-        after_snapshot = await _capture_action_snapshot(page)
-        if _snapshot_changed(before_snapshot, after_snapshot):
-            return True
-
-    return False
-
-
 def _strip_markdown_artifacts(value: str) -> str:
-    text = value
-    text = text.replace("\u00a0", " ").replace("\u202f", " ").replace("\u2007", " ")
+    text = _normalize_spacing(value)
     text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)
     text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
     text = re.sub(r"\[\d+\]", "", text)
     text = text.replace("**", "").replace("__", "").replace("`", "")
-    text = re.sub(r"\s+", " ", text).strip()
     if text.startswith("* "):
         text = text[2:].strip()
     return text
 
 
-def _normalize_tool_text(value: str) -> str:
+def _normalize_spacing(value: str) -> str:
     text = value.replace("\u00a0", " ").replace("\u202f", " ").replace("\u2007", " ")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def _truncate_for_span_log(value: str, *, limit: int = 1500) -> str:
-    if len(value) <= limit:
-        return value
-    return f"{value[:limit]}...<truncated>"
+def _normalize_tool_text(value: str) -> str:
+    return _normalize_spacing(value)
 
 
-def _result_for_root_span_log(result: AgentResult) -> dict[str, Any]:
+def _error_detail(error: Exception, *, limit: int = 180) -> str:
+    message = _normalize_tool_text(str(error)) if str(error).strip() else error.__class__.__name__
+    detail = f"{error.__class__.__name__}: {message}"
+    if len(detail) > limit:
+        return f"{detail[: limit - 3]}..."
+    return detail
+
+
+def _normalized_page_identity(url: str) -> str:
+    parsed = urlsplit(url)
+    path = parsed.path.rstrip("/") or "/"
+    return f"{parsed.scheme}://{parsed.netloc}{path}"
+
+
+def _generic_url_tokens(url: str) -> set[str]:
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").replace("www.", " ")
+    parts = re.split(r"[^a-z0-9]+", f"{host} {parsed.path}".lower())
     return {
-        "answer": _truncate_for_span_log(result.answer) if result.answer else None,
-        "structured_data": result.structured_data,
-        "source_url": result.source_url,
-        "evidence": _truncate_for_span_log(result.evidence) if result.evidence else None,
-        "confidence": result.confidence,
-        "error": result.error,
-        "trace_steps": len(result.trace),
+        token
+        for token in parts
+        if len(token) > 1
+        and token
+        not in {"com", "org", "net", "www", "http", "https", "en", "us", "new", "index"}
     }
 
 
-def _serialize_llm_message(message: Any) -> dict[str, Any]:
-    if isinstance(message, BaseMessage):
-        return message.model_dump()
-    return {"type": type(message).__name__, "value": str(message)}
+def _url_target_overlap(current_url: str, current_title: str, target_url: str) -> bool:
+    parsed_target = urlsplit(target_url)
+    path_tokens = {
+        token
+        for token in re.split(r"[^a-z0-9]+", parsed_target.path.lower())
+        if len(token) > 1 and token not in {"en", "us", "new", "index"}
+    }
+    target_tokens = path_tokens or _generic_url_tokens(target_url)
+    if not target_tokens:
+        return False
+    current_tokens = _generic_url_tokens(current_url) | query_tokens(current_title)
+    overlap = len(target_tokens & current_tokens)
+    required = 1 if len(target_tokens) <= _SMALL_TARGET_TOKEN_SET_SIZE else 2
+    return overlap >= required
 
 
-def _serialize_llm_messages(messages: list[BaseMessage]) -> list[dict[str, Any]]:
-    return [_serialize_llm_message(message) for message in messages]
+def _prompt_requests_title(target_prompt: str, extraction_schema: dict[str, str] | None) -> bool:
+    prompt = target_prompt.lower()
+    if re.search(r"\b(title|heading|headline|page title)\b", prompt):
+        return True
+
+    if extraction_schema:
+        for field_name, description in extraction_schema.items():
+            combined = f"{field_name} {description}".lower()
+            if re.search(r"\b(title|heading|headline|name)\b", combined):
+                return True
+    return False
+
+
+def _tool_arg_preview(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        normalized = _normalize_tool_text(value)
+        if len(normalized) > 160:
+            return f"{normalized[:157]}..."
+        return normalized
+    if isinstance(value, list):
+        return [_tool_arg_preview(item) for item in value[:4]]
+    if isinstance(value, dict):
+        return {str(key): _tool_arg_preview(item) for key, item in list(value.items())[:8]}
+    return type(value).__name__
+
+
+def _tool_call_summaries(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for call in tool_calls:
+        tool_name = call.get("name")
+        tool_args = call.get("args")
+        summary: dict[str, Any] = {"name": str(tool_name) if tool_name is not None else ""}
+        if isinstance(tool_args, dict):
+            summary["args"] = _tool_arg_preview(tool_args)
+        summaries.append(summary)
+    return summaries
+
+
+def _normalize_confidence_value(confidence: float | int | str | None) -> float | None:
+    if confidence is None:
+        return None
+    if isinstance(confidence, bool):
+        return 1.0 if confidence else 0.0
+    if isinstance(confidence, (int, float)):
+        value = float(confidence)
+    else:
+        normalized = _normalize_tool_text(confidence).lower()
+        keyword_values = {"high": 0.85, "medium": 0.5, "low": 0.2}
+        if normalized in keyword_values:
+            value = keyword_values[normalized]
+        else:
+            percent = normalized.endswith("%")
+            if percent:
+                normalized = normalized[:-1].strip()
+            try:
+                value = float(normalized)
+            except ValueError:
+                return None
+            if percent or value > 1:
+                value = value / 100.0
+
+    if value < 0:
+        return 0.0
+    if value > 1:
+        return 1.0
+    return value
 
 
 def _extract_markdown_table_rows(markdown: str) -> list[tuple[str, str]]:
@@ -254,18 +313,16 @@ def _field_aliases(field_name: str, field_description: str) -> list[str]:
     aliases: set[str] = {base}
     if base.endswith(" date"):
         aliases.add(base.replace(" date", ""))
+    if base.endswith(" name"):
+        aliases.add(base.replace(" name", ""))
+    if base.endswith(" title"):
+        aliases.add(base.replace(" title", ""))
+    if base.endswith(" url"):
+        aliases.add(base.replace(" url", ""))
 
-    source = f"{base} {field_description.lower()}"
-    if "director" in source:
-        aliases.update({"director", "directed by"})
-    if "producer" in source:
-        aliases.update({"producer", "produced by"})
-    if "release" in source and "date" in source:
-        aliases.update({"release date", "released", "release"})
-    if "designer" in source:
-        aliases.update({"designer", "designed by"})
-    if "first appeared" in source:
-        aliases.add("first appeared")
+    normalized_description = re.sub(r"[^a-z0-9]+", " ", field_description.lower()).strip()
+    if normalized_description and len(normalized_description.split()) <= 4:
+        aliases.add(normalized_description)
 
     cleaned_aliases = [
         alias.strip()
@@ -276,12 +333,37 @@ def _field_aliases(field_name: str, field_description: str) -> list[str]:
     return cleaned_aliases
 
 
+def _match_tokens(value: str) -> set[str]:
+    normalized = re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+    if not normalized:
+        return set()
+
+    stopwords = {"a", "an", "and", "by", "for", "in", "of", "on", "the", "to"}
+    tokens: set[str] = set()
+    for word in normalized.split():
+        if len(word) <= 1 or word in stopwords:
+            continue
+        tokens.add(word)
+        if len(word) > 4 and word.endswith("ed"):
+            tokens.add(word[:-2])
+        if len(word) > 5 and word.endswith("ing"):
+            tokens.add(word[:-3])
+        if len(word) > 4 and word.endswith(("er", "or")):
+            tokens.add(word[:-2])
+        if len(word) > 4 and word.endswith("es"):
+            tokens.add(word[:-2])
+        if len(word) > 3 and word.endswith("s"):
+            tokens.add(word[:-1])
+    return tokens
+
+
 def _match_table_value(rows: list[tuple[str, str]], aliases: list[str]) -> tuple[str | None, str | None]:
     best_score = 0
     best_value: str | None = None
     best_key: str | None = None
     for alias in aliases:
         alias_lower = alias.lower()
+        alias_tokens = _match_tokens(alias_lower)
         for key, value in rows:
             key_lower = key.lower()
             score = 0
@@ -291,6 +373,12 @@ def _match_table_value(rows: list[tuple[str, str]], aliases: list[str]) -> tuple
                 score = 2
             elif alias_lower in key_lower:
                 score = 1
+            elif alias_tokens:
+                overlap = alias_tokens & _match_tokens(key_lower)
+                if overlap == alias_tokens:
+                    score = 2
+                elif overlap:
+                    score = 1
 
             if score > best_score:
                 best_score = score
@@ -364,452 +452,6 @@ def _schema_fallback_decision(
     )
 
 
-def _normalize_hint_text(value: str | None) -> str | None:
-    if value is None:
-        return None
-    normalized = " ".join(value.split()).strip()
-    return normalized or None
-
-
-def _unquote_selector_value(raw: str) -> str:
-    stripped = raw.strip()
-    if len(stripped) >= 2 and (
-        (stripped.startswith('"') and stripped.endswith('"'))
-        or (stripped.startswith("'") and stripped.endswith("'"))
-    ):
-        stripped = stripped[1:-1]
-    return stripped.replace('\\"', '"').replace("\\'", "'").replace("\\\\", "\\")
-
-
-def _extract_selector_hint(selector: str) -> str | None:
-    normalized_selector = selector.strip()
-    if not normalized_selector:
-        return None
-
-    if normalized_selector.startswith("text="):
-        return _normalize_hint_text(_unquote_selector_value(normalized_selector[len("text=") :]))
-
-    role_name_match = re.search(
-        r"""name\s*=\s*(?:"([^"]+)"|'([^']+)')""",
-        normalized_selector,
-    )
-    if role_name_match:
-        return _normalize_hint_text(role_name_match.group(1) or role_name_match.group(2))
-
-    for attr in ("aria-label", "placeholder", "name", "id", "title", "alt", "value"):
-        attr_match = re.search(
-            rf"""\[{re.escape(attr)}\s*=\s*(?:"([^"]+)"|'([^']+)')\]""",
-            normalized_selector,
-        )
-        if attr_match:
-            return _normalize_hint_text(attr_match.group(1) or attr_match.group(2))
-
-    return None
-
-
-def _escape_selector_value(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def _parse_css_selector(selector: str) -> tuple[str, int | None] | None:
-    if not selector.startswith("css="):
-        return None
-    css_selector = selector[len("css=") :].strip()
-    if not css_selector:
-        return None
-
-    base_selector = css_selector
-    nth_index: int | None = None
-    if " >> nth=" in css_selector:
-        base_selector, nth_part = css_selector.rsplit(" >> nth=", 1)
-        base_selector = base_selector.strip()
-        if not base_selector:
-            return None
-        try:
-            nth_index = int(nth_part.strip())
-        except ValueError:
-            return None
-        if nth_index < 0:
-            return None
-
-    return (base_selector, nth_index)
-
-
-def _dedupe_selectors(candidates: list[str], *, exclude: str | None = None) -> list[str]:
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        normalized = candidate.strip()
-        if not normalized:
-            continue
-        if exclude is not None and normalized == exclude:
-            continue
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        deduped.append(normalized)
-    return deduped
-
-
-def _click_fallback_selectors(selector: str) -> list[str]:
-    fallback_selectors: list[str] = []
-    parsed_css_selector = _parse_css_selector(selector)
-    if parsed_css_selector is not None:
-        base_selector, _ = parsed_css_selector
-        fallback_selectors.append(f"css={base_selector}")
-
-    hint = _extract_selector_hint(selector)
-    if hint:
-        escaped_hint = _escape_selector_value(hint)
-        fallback_selectors.extend(
-            [
-                f'role=link[name="{escaped_hint}"]',
-                f'role=button[name="{escaped_hint}"]',
-                f'text="{escaped_hint}"',
-            ]
-        )
-
-    return _dedupe_selectors(fallback_selectors, exclude=selector)
-
-
-def _type_fallback_selectors(selector: str) -> list[str]:
-    fallback_selectors: list[str] = []
-    hint = _extract_selector_hint(selector)
-    if hint:
-        escaped_hint = _escape_selector_value(hint)
-        fallback_selectors.extend(
-            [
-                f'role=textbox[name="{escaped_hint}"]',
-                f'css=input[aria-label="{escaped_hint}"]',
-                f'css=input[placeholder="{escaped_hint}"]',
-                f'css=textarea[aria-label="{escaped_hint}"]',
-                f'css=input[name="{escaped_hint}"]',
-            ]
-        )
-
-    fallback_selectors.extend(
-        [
-            "css=input[type='search']",
-            "css=input[type='text']",
-            "css=textarea",
-        ]
-    )
-
-    parsed_css_selector = _parse_css_selector(selector)
-    if parsed_css_selector is not None:
-        base_selector, _ = parsed_css_selector
-        fallback_selectors.append(f"css={base_selector}")
-
-    return _dedupe_selectors(fallback_selectors, exclude=selector)
-
-
-async def _wait_short(page: Page, timeout_ms: int) -> None:
-    wait_fn = getattr(page, "wait_for_timeout", None)
-    if not callable(wait_fn):
-        return
-    try:
-        await wait_fn(timeout_ms)
-    except Exception:
-        pass
-
-
-async def _wait_for_selector_visible(page: Page, selector: str, *, timeout_ms: int = 3500) -> None:
-    wait_for_selector_fn = getattr(page, "wait_for_selector", None)
-    if not callable(wait_for_selector_fn):
-        return
-    try:
-        await wait_for_selector_fn(selector, state="visible", timeout=timeout_ms)
-    except TypeError:
-        try:
-            await wait_for_selector_fn(selector, timeout=timeout_ms)
-        except Exception:
-            pass
-    except Exception:
-        pass
-
-
-async def _try_click_selector(page: Page, selector: str) -> bool:
-    await _wait_for_selector_visible(page, selector)
-
-    click_fn = getattr(page, "click", None)
-    if not callable(click_fn):
-        return False
-    try:
-        await click_fn(selector, timeout=5000)
-        return True
-    except TypeError:
-        try:
-            await click_fn(selector)
-            return True
-        except Exception:
-            return False
-    except Exception:
-        return False
-
-
-async def _try_type_and_submit_selector(page: Page, selector: str, text: str) -> bool:
-    await _wait_for_selector_visible(page, selector)
-
-    focus_fn = getattr(page, "focus", None)
-    if callable(focus_fn):
-        try:
-            await focus_fn(selector)
-        except Exception:
-            pass
-
-    fill_fn = getattr(page, "fill", None)
-    press_fn = getattr(page, "press", None)
-    if not callable(fill_fn) or not callable(press_fn):
-        return False
-
-    try:
-        await fill_fn(selector, text)
-        await press_fn(selector, "Enter")
-        return True
-    except Exception:
-        return False
-
-
-async def _click_via_css_fallback(page: Page, selector: str) -> bool:
-    parsed_css_selector = _parse_css_selector(selector)
-    if parsed_css_selector is None:
-        return False
-    base_selector, nth_index = parsed_css_selector
-
-    evaluate_fn = getattr(page, "evaluate", None)
-    if not callable(evaluate_fn):
-        return False
-
-    try:
-        clicked = await evaluate_fn(
-            """(payload) => {
-                const { baseSelector, nthIndex } = payload;
-                let el = null;
-                if (typeof nthIndex === "number" && Number.isInteger(nthIndex) && nthIndex >= 0) {
-                    const nodes = document.querySelectorAll(baseSelector);
-                    el = nodes.length > nthIndex ? nodes[nthIndex] : null;
-                } else {
-                    el = document.querySelector(baseSelector);
-                }
-                if (!el) return false;
-                const style = window.getComputedStyle(el);
-                const rect = el.getBoundingClientRect();
-                const isDisabled = Boolean(el.disabled);
-                const isVisible =
-                  style.display !== "none" &&
-                  style.visibility !== "hidden" &&
-                  rect.width > 0 &&
-                  rect.height > 0 &&
-                  !isDisabled;
-                if (!isVisible) return false;
-                el.click();
-                return true;
-            }""",
-            {"baseSelector": base_selector, "nthIndex": nth_index},
-        )
-    except Exception:
-        return False
-
-    if clicked is True:
-        await _wait_short(page, 300)
-        return True
-    return False
-
-
-async def _click_via_text_heuristic(page: Page, hint: str | None) -> bool:
-    if not hint:
-        return False
-    evaluate_fn = getattr(page, "evaluate", None)
-    if not callable(evaluate_fn):
-        return False
-
-    try:
-        clicked = await evaluate_fn(
-            """(payload) => {
-                const hint = String(payload?.hint || "").trim().toLowerCase();
-                if (!hint) return false;
-                const normalize = (value) => String(value || "").replace(/\\s+/g, " ").trim().toLowerCase();
-                const isVisible = (el) => {
-                    const style = window.getComputedStyle(el);
-                    const rect = el.getBoundingClientRect();
-                    const disabled = Boolean(el.disabled);
-                    return (
-                        style.display !== "none" &&
-                        style.visibility !== "hidden" &&
-                        rect.width > 0 &&
-                        rect.height > 0 &&
-                        !disabled
-                    );
-                };
-                const candidates = Array.from(
-                    document.querySelectorAll(
-                        "a[href],button,input[type='submit'],input[type='button'],[role='button'],[role='link']"
-                    )
-                );
-                let best = null;
-                let bestScore = 0;
-                for (const el of candidates) {
-                    if (!isVisible(el)) continue;
-                    const label = normalize(
-                        el.getAttribute("aria-label") ||
-                        el.innerText ||
-                        el.textContent ||
-                        el.value ||
-                        el.getAttribute("title")
-                    );
-                    if (!label) continue;
-                    let score = 0;
-                    if (label === hint) score = 3;
-                    else if (label.includes(hint)) score = 2;
-                    else if (hint.includes(label) && label.length >= 4) score = 1;
-                    if (score > bestScore) {
-                        best = el;
-                        bestScore = score;
-                        if (score === 3) break;
-                    }
-                }
-                if (!best) return false;
-                best.click();
-                return true;
-            }""",
-            {"hint": hint},
-        )
-    except Exception:
-        return False
-
-    if clicked is True:
-        await _wait_short(page, 300)
-        return True
-    return False
-
-
-async def _click_single_visible_link(page: Page) -> bool:
-    evaluate_fn = getattr(page, "evaluate", None)
-    if not callable(evaluate_fn):
-        return False
-
-    try:
-        clicked = await evaluate_fn(
-            """() => {
-                // singleVisibleLinkFallback
-                const isVisible = (el) => {
-                    const style = window.getComputedStyle(el);
-                    const rect = el.getBoundingClientRect();
-                    return (
-                        style.display !== "none" &&
-                        style.visibility !== "hidden" &&
-                        rect.width > 0 &&
-                        rect.height > 0
-                    );
-                };
-                const links = Array.from(document.querySelectorAll("a[href]")).filter(isVisible);
-                if (links.length !== 1) return false;
-                links[0].click();
-                return true;
-            }"""
-        )
-    except Exception:
-        return False
-
-    if clicked is True:
-        await _wait_short(page, 300)
-        return True
-    return False
-
-
-async def _type_and_submit_via_text_heuristic(page: Page, text: str, hint: str | None) -> bool:
-    evaluate_fn = getattr(page, "evaluate", None)
-    if not callable(evaluate_fn):
-        return False
-
-    try:
-        submitted = await evaluate_fn(
-            """(payload) => {
-                const text = String(payload?.text || "");
-                if (!text) return false;
-                const hint = String(payload?.hint || "").trim().toLowerCase();
-                const normalize = (value) => String(value || "").replace(/\\s+/g, " ").trim().toLowerCase();
-                const editableInput = (el) => {
-                    if (!el) return false;
-                    const tag = String(el.tagName || "").toLowerCase();
-                    if (tag === "textarea") return true;
-                    if (tag !== "input") return false;
-                    const t = String(el.getAttribute("type") || "text").toLowerCase();
-                    return ["", "text", "search", "email", "url", "tel", "password"].includes(t);
-                };
-                const isVisibleEnabled = (el) => {
-                    const style = window.getComputedStyle(el);
-                    const rect = el.getBoundingClientRect();
-                    return (
-                        style.display !== "none" &&
-                        style.visibility !== "hidden" &&
-                        rect.width > 0 &&
-                        rect.height > 0 &&
-                        !el.disabled
-                    );
-                };
-                const associatedLabel = (el) => {
-                    if (!el) return "";
-                    const direct = el.getAttribute("aria-label") || el.getAttribute("placeholder");
-                    if (direct) return direct;
-                    const id = el.getAttribute("id");
-                    if (id) {
-                        const label = document.querySelector(`label[for="${CSS.escape(id)}"]`);
-                        if (label && label.textContent) return label.textContent;
-                    }
-                    const wrapped = el.closest("label");
-                    if (wrapped && wrapped.textContent) return wrapped.textContent;
-                    return el.getAttribute("name") || el.getAttribute("id") || "";
-                };
-
-                const candidates = Array.from(document.querySelectorAll("input,textarea"));
-                let best = null;
-                let bestScore = -1;
-                for (const el of candidates) {
-                    if (!editableInput(el) || !isVisibleEnabled(el)) continue;
-                    const label = normalize(associatedLabel(el));
-                    let score = 0;
-                    if (hint) {
-                        if (label === hint) score = 4;
-                        else if (label.includes(hint)) score = 3;
-                        else if (hint.includes(label) && label.length >= 3) score = 2;
-                    } else {
-                        score = 1;
-                    }
-                    if (score > bestScore) {
-                        best = el;
-                        bestScore = score;
-                        if (score === 4) break;
-                    }
-                }
-                if (!best) return false;
-
-                best.focus();
-                best.value = text;
-                best.dispatchEvent(new Event("input", { bubbles: true }));
-                best.dispatchEvent(new Event("change", { bubbles: true }));
-
-                if (best.form && typeof best.form.requestSubmit === "function") {
-                    best.form.requestSubmit();
-                    return true;
-                }
-                if (best.form) {
-                    best.form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
-                }
-                best.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true }));
-                best.dispatchEvent(new KeyboardEvent("keypress", { key: "Enter", code: "Enter", bubbles: true }));
-                best.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true }));
-                return true;
-            }""",
-            {"text": text, "hint": hint},
-        )
-    except Exception:
-        return False
-
-    if submitted:
-        await _wait_short(page, 300)
-    return bool(submitted)
-
 
 def _decision_from_tool_message(message: ToolMessage) -> AgentDecision:
     if not isinstance(message.content, str):
@@ -871,7 +513,212 @@ def _normalize_extraction_schema(
     return normalized
 
 
+def _normalize_task_value_map(
+    value: Mapping[str, str] | None,
+    *,
+    field_name: str,
+) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not value:
+        raise ValueError(f"{field_name}_empty")
+
+    normalized: dict[str, str] = {}
+    for key, raw_value in value.items():
+        if not isinstance(key, str):
+            raise ValueError(f"{field_name}_invalid_key")
+        if not isinstance(raw_value, str):
+            raise ValueError(f"{field_name}_invalid_value")
+        normalized_key = key.strip()
+        normalized_value = raw_value.strip()
+        if not normalized_key:
+            raise ValueError(f"{field_name}_invalid_key")
+        if not normalized_value:
+            raise ValueError(f"{field_name}_invalid_value")
+        normalized[normalized_key] = normalized_value
+    return normalized
+
+
+def _normalize_completion_status(status: str) -> str:
+    normalized = status.strip().lower()
+    allowed_statuses = {"completed", "blocked", "requires_user_input", "requires_approval"}
+    if normalized not in allowed_statuses:
+        raise ValueError("complete_goal_invalid_status")
+    return normalized
+
+
+def _analysis_summary_text(
+    summary: str,
+    *,
+    recommended_action: str,
+    recommended_interactable_ref: str | None,
+    recommended_selector: str | None,
+    recommended_value: str | None,
+    blocker_summary: str | None,
+    completion_signals: list[str],
+) -> str:
+    parts = [summary.strip()]
+    parts.append(f"best_next_action={recommended_action.strip()}")
+    if recommended_interactable_ref:
+        parts.append(f"interactable_ref={recommended_interactable_ref.strip()}")
+    if recommended_selector:
+        parts.append(f"selector={recommended_selector.strip()}")
+    if recommended_value:
+        parts.append(f"value={recommended_value.strip()}")
+    if blocker_summary:
+        parts.append(f"blockers={blocker_summary.strip()}")
+    if completion_signals:
+        parts.append(f"completion_signals={'; '.join(signal.strip() for signal in completion_signals[:3])}")
+    return " | ".join(part for part in parts if part)
+
+
+def _verification_summary_text(
+    summary: str,
+    *,
+    verified: bool,
+    missing_requirements: list[str],
+    recommended_next_action: str | None,
+) -> str:
+    parts = [summary.strip(), f"verified={verified}"]
+    if missing_requirements:
+        parts.append(
+            f"missing={'; '.join(item.strip() for item in missing_requirements[:3])}"
+        )
+    if recommended_next_action:
+        parts.append(f"next_action={recommended_next_action.strip()}")
+    return " | ".join(part for part in parts if part)
+
+
 def _build_tools(runtime: _Runtime):
+    def _find_interactable_by_ref(interactable_ref: str | None) -> Interactable | None:
+        if interactable_ref is None:
+            return None
+        normalized_ref = interactable_ref.strip()
+        if not normalized_ref:
+            return None
+        page_state = runtime.current_page_state
+        if page_state is None:
+            return None
+        return next(
+            (item for item in page_state.interactables if (item.ref or "") == normalized_ref),
+            None,
+        )
+
+    def _find_interactable_by_selector(selector: str | None) -> Interactable | None:
+        if selector is None:
+            return None
+        normalized_selector = selector.strip()
+        if not normalized_selector:
+            return None
+        page_state = runtime.current_page_state
+        if page_state is None:
+            return None
+        return next(
+            (item for item in page_state.interactables if item.selector == normalized_selector),
+            None,
+        )
+
+    def _resolve_action_target(
+        *,
+        selector: str | None,
+        interactable_ref: str | None,
+        allowed_kinds: set[str] | None = None,
+    ) -> tuple[str | None, Interactable | None, str | None]:
+        normalized_ref = interactable_ref.strip() if interactable_ref is not None else None
+        if normalized_ref == "":
+            normalized_ref = None
+        interactable = _find_interactable_by_ref(normalized_ref)
+        if normalized_ref is not None and interactable is None:
+            return None, None, "unknown_interactable_ref"
+        if interactable is not None and allowed_kinds is not None and interactable.kind not in allowed_kinds:
+            return None, interactable, "interactable_kind_mismatch"
+        if interactable is not None:
+            return interactable.selector, interactable, None
+
+        normalized_selector = _normalize_tool_text(selector) if selector and selector.strip() else None
+        if normalized_selector:
+            return normalized_selector, _find_interactable_by_selector(normalized_selector), None
+        return None, None, "missing_selector"
+
+    def _resolve_navigation_url(url: str) -> str | None:
+        normalized_url = _normalize_tool_text(url) if url.strip() else ""
+        if not normalized_url:
+            return None
+
+        parsed = urlsplit(normalized_url)
+        if parsed.scheme:
+            if parsed.scheme not in {"http", "https"}:
+                return None
+            if not parsed.netloc:
+                return None
+            return normalized_url
+
+        current_url = getattr(runtime.page, "url", "") or ""
+        resolved_url = urljoin(current_url, normalized_url)
+        resolved = urlsplit(resolved_url)
+        if resolved.scheme not in {"http", "https"} or not resolved.netloc:
+            return None
+        return resolved_url
+
+    def _resolve_navigation_target(
+        *,
+        url: str | None,
+        interactable_ref: str | None,
+    ) -> tuple[str | None, Interactable | None, str | None]:
+        if url is not None and url.strip():
+            resolved_url = _resolve_navigation_url(url)
+            if resolved_url is None:
+                return None, None, "navigate_invalid_url"
+            interactable = _find_interactable_by_ref(interactable_ref.strip()) if interactable_ref else None
+            return resolved_url, interactable, None
+
+        normalized_ref = interactable_ref.strip() if interactable_ref is not None else None
+        if normalized_ref == "":
+            normalized_ref = None
+        interactable = _find_interactable_by_ref(normalized_ref)
+        if normalized_ref is not None and interactable is None:
+            return None, None, "unknown_interactable_ref"
+        if interactable is not None:
+            if interactable.kind != "link" or not interactable.href:
+                return None, interactable, "interactable_missing_href"
+            resolved_url = _resolve_navigation_url(interactable.href)
+            if resolved_url is None:
+                return None, interactable, "navigate_invalid_url"
+            return resolved_url, interactable, None
+
+        if url is None or not url.strip():
+            return None, None, "navigate_missing_target"
+        resolved_url = _resolve_navigation_url(url)
+        if resolved_url is None:
+            return None, None, "navigate_invalid_url"
+        return resolved_url, None, None
+
+    def _target_is_present(selector: str | None, interactable_ref: str | None) -> bool:
+        if interactable_ref is not None:
+            return _find_interactable_by_ref(interactable_ref) is not None
+        if selector is None:
+            return False
+        normalized_selector = selector.strip()
+        if not normalized_selector:
+            return False
+        page_state = runtime.current_page_state
+        if page_state is None:
+            return True
+        return any(item.selector == normalized_selector for item in page_state.interactables)
+
+    async def _runtime_page_state() -> PageState:
+        page_state = await runtime.snapshot_service.capture()
+        runtime.current_page_state = page_state
+        return page_state
+
+    async def _verification_is_current() -> bool:
+        current_url = getattr(runtime.page, "url", "") or ""
+        return bool(
+            runtime.last_verification_passed is True
+            and runtime.last_verification_url
+            and runtime.last_verification_url == current_url
+        )
+
     def _decision_json(
         action: str,
         step_summary: str,
@@ -894,134 +741,566 @@ def _build_tools(runtime: _Runtime):
         operation: Callable[[], Awaitable[None]],
         wait_dom: bool = True,
         verify_effect: bool = False,
+        verify_state: Callable[[], Awaitable[bool]] | None = None,
+        invalidate_verification: bool = False,
         **decision_kwargs: object,
     ) -> str:
         try:
             before_snapshot: tuple[str, str, str] | None = None
-            if verify_effect:
-                before_snapshot = await _capture_action_snapshot(runtime.page)
+            if verify_effect and verify_state is None:
+                before_snapshot = await capture_dom_signature(runtime.page)
 
             await operation()
             if wait_dom:
                 await _wait_domcontentloaded(runtime.page, timeout=10000)
 
-            if verify_effect and before_snapshot is not None:
-                after_snapshot = await _capture_action_snapshot(runtime.page)
-                if not _snapshot_changed(before_snapshot, after_snapshot):
-                    has_effect = await _wait_for_action_effect(runtime.page, before_snapshot)
+            if verify_state is not None:
+                if not await verify_state():
+                    raise RuntimeError("action_had_no_effect")
+            elif verify_effect and before_snapshot is not None:
+                after_snapshot = await capture_dom_signature(runtime.page)
+                if before_snapshot == after_snapshot:
+                    has_effect = await wait_for_action_effect(runtime.page, before_snapshot)
                     if not has_effect:
                         raise RuntimeError("action_had_no_effect")
+
+            if invalidate_verification:
+                runtime.last_verification_passed = None
+                runtime.last_verification_url = None
+                runtime.snapshot_service.invalidate()
+                runtime.current_page_state = None
 
             return _decision_json(action, step_summary, next_step, **decision_kwargs)
         except Exception:
             return _fail_decision_json(fail_reason, step_summary, next_step)
 
-    @tool("type_and_submit", args_schema=TypeAndSubmitArgs)
-    async def type_and_submit(
-        selector: str,
-        text: str,
+    @tool("analyze_page", args_schema=AnalyzePageArgs)
+    async def analyze_page(
+        question: str,
         step_summary: str,
         next_step: str,
     ) -> str:
+        """Analyze the current page with Deep Agents and return guidance for the next step."""
+        normalized_question = _normalize_tool_text(question) if question.strip() else ""
+        if not normalized_question:
+            return _fail_decision_json("analyze_page_missing_question", step_summary, next_step)
+
+        try:
+            page_state = await _runtime_page_state()
+        except Exception as exc:
+            return _fail_decision_json(
+                f"analyze_page_capture_failed:{_error_detail(exc)}",
+                step_summary,
+                next_step,
+            )
+
+        try:
+            advisor_budget = compute_context_budget(
+                page_state,
+                goal_type=runtime.goal_type,
+                extraction_schema=runtime.extraction_schema,
+            )
+            async with asyncio.timeout(_DEEP_ADVISOR_TIMEOUT_SECONDS):
+                analysis = await analyze_page_with_deep_agents(
+                    model=runtime.openrouter_client.chat_model(),
+                    page_state=page_state,
+                    target_prompt=runtime.target_prompt,
+                    question=normalized_question,
+                    goal_type=runtime.goal_type,
+                    task_data=runtime.task_data,
+                    sensitive_data=runtime.sensitive_data,
+                    history=runtime.current_trace,
+                    advisor_markdown_chars=advisor_budget.advisor_markdown_chars,
+                )
+        except Exception as exc:
+            analysis = fallback_page_analysis(
+                page_state=page_state,
+                target_prompt=runtime.target_prompt,
+                question=normalized_question,
+                error=exc,
+            )
+
+        return _decision_json(
+            action="analyze",
+            analysis=_analysis_summary_text(
+                analysis.summary,
+                recommended_action=analysis.recommended_action,
+                recommended_interactable_ref=analysis.recommended_interactable_ref,
+                recommended_selector=analysis.recommended_selector,
+                recommended_value=analysis.recommended_value,
+                blocker_summary=analysis.blocker_summary,
+                completion_signals=analysis.completion_signals,
+            ),
+            result_data=analysis.model_dump(mode="json"),
+            confidence=analysis.confidence,
+            step_summary=step_summary,
+            next_step=next_step,
+        )
+
+    @tool("verify_goal", args_schema=VerifyGoalArgs)
+    async def verify_goal(
+        criteria: str,
+        step_summary: str,
+        next_step: str,
+    ) -> str:
+        """Verify the current page really satisfies the browser goal."""
+        normalized_criteria = _normalize_tool_text(criteria) if criteria.strip() else ""
+        if not normalized_criteria:
+            return _fail_decision_json("verify_goal_missing_criteria", step_summary, next_step)
+
+        try:
+            page_state = await _runtime_page_state()
+            verify_budget = compute_context_budget(
+                page_state,
+                goal_type=runtime.goal_type,
+                extraction_schema=runtime.extraction_schema,
+            )
+            async with asyncio.timeout(_DEEP_ADVISOR_TIMEOUT_SECONDS):
+                verification = await verify_goal_with_deep_agents(
+                    model=runtime.openrouter_client.chat_model(),
+                    page_state=page_state,
+                    target_prompt=runtime.target_prompt,
+                    criteria=normalized_criteria,
+                    goal_type=runtime.goal_type,
+                    task_data=runtime.task_data,
+                    sensitive_data=runtime.sensitive_data,
+                    history=runtime.current_trace,
+                    advisor_markdown_chars=verify_budget.advisor_markdown_chars,
+                )
+        except Exception as exc:
+            return _fail_decision_json(
+                f"verify_goal_failed:{_error_detail(exc)}",
+                step_summary,
+                next_step,
+            )
+
+        runtime.last_verification_passed = verification.verified
+        runtime.last_verification_url = getattr(runtime.page, "url", "") or page_state.url
+
+        return _decision_json(
+            action="verify",
+            analysis=_verification_summary_text(
+                verification.summary,
+                verified=verification.verified,
+                missing_requirements=verification.missing_requirements,
+                recommended_next_action=verification.recommended_next_action,
+            ),
+            verified=verification.verified,
+            result_data=verification.model_dump(mode="json"),
+            evidence=verification.evidence,
+            confidence=verification.confidence,
+            step_summary=step_summary,
+            next_step=next_step,
+        )
+
+    @tool("type_and_submit", args_schema=TypeAndSubmitArgs)
+    async def type_and_submit(
+        text: str,
+        step_summary: str,
+        next_step: str,
+        selector: str | None = None,
+        interactable_ref: str | None = None,
+    ) -> str:
         """Type into an input and submit with Enter."""
+        resolved_selector, resolved_interactable, target_error = _resolve_action_target(
+            selector=selector,
+            interactable_ref=interactable_ref,
+            allowed_kinds={"input"},
+        )
+        if target_error is not None or resolved_selector is None:
+            return _fail_decision_json(
+                target_error or "type_and_submit_missing_selector",
+                step_summary,
+                next_step,
+            )
 
         async def _operation() -> None:
-            hint = _extract_selector_hint(selector)
-            fallback_selectors = _type_fallback_selectors(selector)
+            hint = extract_selector_hint(resolved_selector)
+            fallback_selectors = type_fallback_selectors(resolved_selector)
             for attempt in range(2):
                 await _wait_domcontentloaded(runtime.page, timeout=3000)
-                if await _try_type_and_submit_selector(runtime.page, selector, text):
+                if await try_type_and_submit_selector(
+                    runtime.page,
+                    resolved_selector,
+                    text,
+                    wait_timeout_ms=PRIMARY_SELECTOR_WAIT_MS,
+                ):
                     return
 
                 for fallback_selector in fallback_selectors:
-                    if await _try_type_and_submit_selector(runtime.page, fallback_selector, text):
+                    if await try_type_and_submit_selector(
+                        runtime.page,
+                        fallback_selector,
+                        text,
+                        wait_timeout_ms=FALLBACK_SELECTOR_WAIT_MS,
+                    ):
                         return
 
-                if await _type_and_submit_via_text_heuristic(runtime.page, text, hint):
+                if await type_and_submit_via_text_heuristic(runtime.page, text, hint):
                     return
 
                 if attempt == 0:
-                    await _wait_short(runtime.page, 400)
+                    await wait_short(runtime.page, 400)
 
             raise RuntimeError("type_and_submit_failed")
 
         return await _execute_tool_action(
             action="type_and_submit",
             fail_reason="type_and_submit_failed",
-            selector=selector,
+            interactable_ref=resolved_interactable.ref if resolved_interactable is not None else interactable_ref,
+            selector=resolved_selector,
             text=text,
             step_summary=step_summary,
             next_step=next_step,
             operation=_operation,
             verify_effect=True,
+            invalidate_verification=True,
+        )
+
+    @tool("fill", args_schema=FillArgs)
+    async def fill(
+        text: str,
+        step_summary: str,
+        next_step: str,
+        selector: str | None = None,
+        interactable_ref: str | None = None,
+    ) -> str:
+        """Fill a field without submitting it."""
+        resolved_selector, resolved_interactable, target_error = _resolve_action_target(
+            selector=selector,
+            interactable_ref=interactable_ref,
+            allowed_kinds={"input"},
+        )
+        if target_error is not None or resolved_selector is None:
+            return _fail_decision_json(target_error or "fill_missing_selector", step_summary, next_step)
+        resolved_selector_state = {"value": resolved_selector}
+
+        async def _operation() -> None:
+            fallback_selectors = type_fallback_selectors(resolved_selector)
+            for attempt in range(2):
+                await _wait_domcontentloaded(runtime.page, timeout=3000)
+                if await try_fill_selector(
+                    runtime.page,
+                    resolved_selector,
+                    text,
+                    wait_timeout_ms=PRIMARY_SELECTOR_WAIT_MS,
+                ):
+                    resolved_selector_state["value"] = resolved_selector
+                    return
+
+                for fallback_selector in fallback_selectors:
+                    if await try_fill_selector(
+                        runtime.page,
+                        fallback_selector,
+                        text,
+                        wait_timeout_ms=FALLBACK_SELECTOR_WAIT_MS,
+                    ):
+                        resolved_selector_state["value"] = fallback_selector
+                        return
+
+                if attempt == 0:
+                    await wait_short(runtime.page, 300)
+
+            raise RuntimeError("fill_failed")
+
+        return await _execute_tool_action(
+            action="fill",
+            fail_reason="fill_failed",
+            interactable_ref=resolved_interactable.ref if resolved_interactable is not None else interactable_ref,
+            selector=resolved_selector,
+            text=text,
+            step_summary=step_summary,
+            next_step=next_step,
+            operation=_operation,
+            wait_dom=False,
+            verify_state=lambda: selector_value_matches(runtime.page, resolved_selector_state["value"], text),
+            invalidate_verification=True,
+        )
+
+    @tool("submit", args_schema=SubmitArgs)
+    async def submit(
+        step_summary: str,
+        next_step: str,
+        selector: str | None = None,
+        interactable_ref: str | None = None,
+    ) -> str:
+        """Submit a form or field."""
+        resolved_selector, resolved_interactable, target_error = _resolve_action_target(
+            selector=selector,
+            interactable_ref=interactable_ref,
+            allowed_kinds={"input", "button", "select", "checkbox", "radio"},
+        )
+        if target_error is not None or resolved_selector is None:
+            return _fail_decision_json(target_error or "submit_missing_selector", step_summary, next_step)
+
+        async def _operation() -> None:
+            if await try_submit_selector(runtime.page, resolved_selector):
+                return
+            raise RuntimeError("submit_failed")
+
+        return await _execute_tool_action(
+            action="submit",
+            fail_reason="submit_failed",
+            interactable_ref=resolved_interactable.ref if resolved_interactable is not None else interactable_ref,
+            selector=resolved_selector,
+            step_summary=step_summary,
+            next_step=next_step,
+            operation=_operation,
+            verify_effect=True,
+            invalidate_verification=True,
+        )
+
+    @tool("select_option", args_schema=SelectOptionArgs)
+    async def select_option(
+        value: str,
+        step_summary: str,
+        next_step: str,
+        selector: str | None = None,
+        interactable_ref: str | None = None,
+    ) -> str:
+        """Select an option from a dropdown."""
+        resolved_selector, resolved_interactable, target_error = _resolve_action_target(
+            selector=selector,
+            interactable_ref=interactable_ref,
+            allowed_kinds={"select"},
+        )
+        if target_error is not None or resolved_selector is None:
+            return _fail_decision_json(
+                target_error or "select_option_missing_selector",
+                step_summary,
+                next_step,
+            )
+        resolved_selector_state = {"value": resolved_selector}
+
+        async def _operation() -> None:
+            fallback_selectors = select_fallback_selectors(resolved_selector)
+            if await try_select_option_selector(runtime.page, resolved_selector, value):
+                resolved_selector_state["value"] = resolved_selector
+                return
+            for fallback_selector in fallback_selectors:
+                if await try_select_option_selector(runtime.page, fallback_selector, value):
+                    resolved_selector_state["value"] = fallback_selector
+                    return
+            raise RuntimeError("select_option_failed")
+
+        return await _execute_tool_action(
+            action="select_option",
+            fail_reason="select_option_failed",
+            interactable_ref=resolved_interactable.ref if resolved_interactable is not None else interactable_ref,
+            selector=resolved_selector,
+            value=value,
+            step_summary=step_summary,
+            next_step=next_step,
+            operation=_operation,
+            wait_dom=False,
+            verify_state=lambda: selector_has_selected_value(
+                runtime.page,
+                resolved_selector_state["value"],
+                value,
+            ),
+            invalidate_verification=True,
+        )
+
+    @tool("check", args_schema=CheckArgs)
+    async def check(
+        step_summary: str,
+        next_step: str,
+        selector: str | None = None,
+        interactable_ref: str | None = None,
+    ) -> str:
+        """Check a checkbox or radio option."""
+        resolved_selector, resolved_interactable, target_error = _resolve_action_target(
+            selector=selector,
+            interactable_ref=interactable_ref,
+            allowed_kinds={"checkbox", "radio"},
+        )
+        if target_error is not None or resolved_selector is None:
+            return _fail_decision_json(target_error or "check_missing_selector", step_summary, next_step)
+        resolved_selector_state = {"value": resolved_selector}
+
+        async def _operation() -> None:
+            fallback_selectors = check_fallback_selectors(resolved_selector)
+            if await try_check_selector(runtime.page, resolved_selector):
+                resolved_selector_state["value"] = resolved_selector
+                return
+            for fallback_selector in fallback_selectors:
+                if await try_check_selector(runtime.page, fallback_selector):
+                    resolved_selector_state["value"] = fallback_selector
+                    return
+            raise RuntimeError("check_failed")
+
+        return await _execute_tool_action(
+            action="check",
+            fail_reason="check_failed",
+            interactable_ref=resolved_interactable.ref if resolved_interactable is not None else interactable_ref,
+            selector=resolved_selector,
+            step_summary=step_summary,
+            next_step=next_step,
+            operation=_operation,
+            wait_dom=False,
+            verify_state=lambda: selector_is_checked(runtime.page, resolved_selector_state["value"]),
+            invalidate_verification=True,
+        )
+
+    @tool("wait_for", args_schema=WaitForArgs)
+    async def wait_for(
+        state: str,
+        timeout_ms: int,
+        step_summary: str,
+        next_step: str,
+        selector: str | None = None,
+        interactable_ref: str | None = None,
+    ) -> str:
+        """Wait for a selector to reach a specific state."""
+        normalized_state = state.strip().lower()
+        if normalized_state not in {"attached", "visible", "hidden", "detached"}:
+            return _fail_decision_json("wait_for_invalid_state", step_summary, next_step)
+        resolved_selector, resolved_interactable, target_error = _resolve_action_target(
+            selector=selector,
+            interactable_ref=interactable_ref,
+        )
+        if target_error is not None or resolved_selector is None:
+            return _fail_decision_json(target_error or "wait_for_missing_selector", step_summary, next_step)
+
+        async def _operation() -> None:
+            if await try_wait_for_selector(
+                runtime.page,
+                resolved_selector,
+                state=normalized_state,
+                timeout_ms=timeout_ms,
+            ):
+                return
+            raise RuntimeError("wait_for_failed")
+
+        return await _execute_tool_action(
+            action="wait_for",
+            fail_reason="wait_for_failed",
+            interactable_ref=resolved_interactable.ref if resolved_interactable is not None else interactable_ref,
+            selector=resolved_selector,
+            wait_state=normalized_state,
+            timeout_ms=timeout_ms,
+            step_summary=step_summary,
+            next_step=next_step,
+            operation=_operation,
+            wait_dom=False,
+            invalidate_verification=True,
         )
 
     @tool("click", args_schema=ClickArgs)
     async def click(
-        selector: str,
         step_summary: str,
         next_step: str,
+        selector: str | None = None,
+        interactable_ref: str | None = None,
     ) -> str:
         """Click a visible element."""
+        resolved_selector, resolved_interactable, target_error = _resolve_action_target(
+            selector=selector,
+            interactable_ref=interactable_ref,
+            allowed_kinds={"button", "link"},
+        )
+        if target_error is not None or resolved_selector is None or not _target_is_present(
+            resolved_selector,
+            resolved_interactable.ref if resolved_interactable is not None else interactable_ref,
+        ):
+            return _decision_json(
+                action="analyze",
+                analysis=(
+                    "The requested click target was not present in the current snapshot. "
+                    "Choose a visible interactable ref or href from the provided interactables instead of inventing one."
+                ),
+                result_data={
+                    "unknown_selector": selector,
+                    "unknown_interactable_ref": interactable_ref,
+                    "target_error": target_error,
+                },
+                confidence=0.0,
+                step_summary="The requested click target was not present in the current page snapshot.",
+                next_step="Use a visible interactable ref or stable href from the current interactables.",
+            )
 
         async def _operation() -> None:
-            hint = _extract_selector_hint(selector)
-            fallback_selectors = _click_fallback_selectors(selector)
+            hint = extract_selector_hint(resolved_selector)
+            fallback_selectors = click_fallback_selectors(resolved_selector)
             for attempt in range(2):
                 await _wait_domcontentloaded(runtime.page, timeout=3000)
-                if await _try_click_selector(runtime.page, selector):
+                if await try_click_selector(runtime.page, resolved_selector):
                     return
 
                 for fallback_selector in fallback_selectors:
-                    if await _try_click_selector(runtime.page, fallback_selector):
+                    if await try_click_selector(runtime.page, fallback_selector):
                         return
 
-                if await _click_via_text_heuristic(runtime.page, hint):
+                if await click_via_text_heuristic(runtime.page, hint):
                     return
 
-                if await _click_single_visible_link(runtime.page):
+                if await click_single_visible_link(runtime.page):
                     return
 
-                if await _click_via_css_fallback(runtime.page, selector):
+                if await click_via_css_fallback(runtime.page, resolved_selector):
                     return
 
                 if attempt == 0:
-                    await _wait_short(runtime.page, 400)
+                    await wait_short(runtime.page, 400)
 
             raise RuntimeError("click_failed")
 
         return await _execute_tool_action(
             action="click",
             fail_reason="click_failed",
-            selector=selector,
+            interactable_ref=resolved_interactable.ref if resolved_interactable is not None else interactable_ref,
+            selector=resolved_selector,
             step_summary=step_summary,
             next_step=next_step,
             operation=_operation,
             verify_effect=True,
+            invalidate_verification=True,
         )
 
     @tool("navigate", args_schema=NavigateArgs)
     async def navigate(
-        url: str,
         step_summary: str,
         next_step: str,
+        url: str | None = None,
+        interactable_ref: str | None = None,
+        selector: str | None = None,
     ) -> str:
-        """Navigate to an absolute URL."""
-        if not url.startswith(("http://", "https://")):
-            return _fail_decision_json("navigate_requires_absolute_url", step_summary, next_step)
+        """Navigate to a stable URL or href. Relative URLs are resolved against the current page."""
+        _ = selector
+        resolved_url, resolved_interactable, target_error = _resolve_navigation_target(
+            url=url,
+            interactable_ref=interactable_ref,
+        )
+        if target_error is not None or resolved_url is None:
+            return _fail_decision_json(target_error or "navigate_invalid_url", step_summary, next_step)
 
         async def _operation() -> None:
-            await runtime.page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            await goto_with_fallback(runtime.page, resolved_url, timeout_ms=15000)
+
+        async def _navigation_reached_target() -> bool:
+            current_url = getattr(runtime.page, "url", "") or ""
+            if _normalized_page_identity(current_url) == _normalized_page_identity(resolved_url):
+                return True
+            title_fn = getattr(runtime.page, "title", None)
+            current_title = ""
+            if callable(title_fn):
+                try:
+                    current_title = _normalize_tool_text(await title_fn())
+                except Exception:
+                    current_title = ""
+            return _url_target_overlap(current_url, current_title, resolved_url)
 
         return await _execute_tool_action(
             action="navigate",
             fail_reason="navigate_failed",
-            url=url,
+            interactable_ref=resolved_interactable.ref if resolved_interactable is not None else interactable_ref,
+            url=resolved_url,
             step_summary=step_summary,
             next_step=next_step,
             operation=_operation,
             wait_dom=False,
-            verify_effect=True,
+            verify_state=_navigation_reached_target,
+            invalidate_verification=True,
         )
 
     @tool("extract_answer", args_schema=ExtractAnswerArgs)
@@ -1029,7 +1308,7 @@ def _build_tools(runtime: _Runtime):
         answer: str | None,
         structured_data: dict[str, str | None] | None,
         evidence: str,
-        confidence: float | None,
+        confidence: float | int | str | None,
         step_summary: str,
         next_step: str,
     ) -> str:
@@ -1041,7 +1320,59 @@ def _build_tools(runtime: _Runtime):
                 key: (_normalize_tool_text(value) if isinstance(value, str) and value.strip() else None)
                 for key, value in structured_data.items()
             }
+        normalized_answer = _normalize_tool_text(answer) if answer and answer.strip() else None
         normalized_evidence = _normalize_tool_text(evidence) if evidence.strip() else evidence
+        normalized_confidence = _normalize_confidence_value(confidence)
+        page_state = runtime.current_page_state
+        task_query = extract_task_query(runtime.target_prompt)
+        destination_required = task_requires_destination_page(runtime.target_prompt)
+
+        # Detect stuck loops: if the last 2 trace steps are both analyze on
+        # the same URL, let the extraction through even if destination check
+        # would normally block it.
+        _stuck_in_loop = False
+        if (
+            page_state is not None
+            and len(runtime.current_trace) >= 2
+            and all(
+                s.decision.action == "analyze" and s.url == page_state.url
+                for s in runtime.current_trace[-2:]
+            )
+        ):
+            _stuck_in_loop = True
+
+        if (
+            not _stuck_in_loop
+            and runtime.extraction_schema is None
+            and page_state is not None
+            and task_query
+            and destination_required
+        ):
+            progress = search_progress_state(page_state, runtime.target_prompt)
+            on_start_page = _normalized_page_identity(page_state.url) == _normalized_page_identity(runtime.start_url)
+            identity_match = page_identity_matches_query(page_state, task_query)
+
+            if (
+                _prompt_requests_title(runtime.target_prompt, runtime.extraction_schema)
+                and (on_start_page or progress in {"search_entry", "results_list"})
+                and not identity_match
+            ):
+                return _decision_json(
+                    action="analyze",
+                    analysis=(
+                        "The destination page has not been reached yet. The agent must navigate further "
+                        "before extracting. Current search stage: " + progress
+                    ),
+                    result_data={
+                        "task_query": task_query,
+                        "current_url": page_state.url,
+                        "current_title": page_state.title,
+                        "search_stage": progress,
+                    },
+                    confidence=0.0,
+                    step_summary="Destination page not reached yet — keep navigating before extracting.",
+                    next_step="Navigate to the target page before attempting extraction.",
+                )
 
         if runtime.extraction_schema:
             if normalized_structured_data is None:
@@ -1070,7 +1401,61 @@ def _build_tools(runtime: _Runtime):
             answer=normalized_answer,
             structured_data=normalized_structured_data,
             evidence=normalized_evidence,
-            confidence=confidence,
+            confidence=normalized_confidence,
+            step_summary=step_summary,
+            next_step=next_step,
+            status="completed",
+            goal_summary=normalized_answer or step_summary,
+            result_data=normalized_structured_data or (
+                {"answer": normalized_answer} if normalized_answer is not None else None
+            ),
+        )
+
+    @tool("complete_goal", args_schema=CompleteGoalArgs)
+    async def complete_goal(
+        status: str,
+        goal_summary: str,
+        result_data: dict[str, Any] | None,
+        evidence: str,
+        confidence: float | int | str | None,
+        step_summary: str,
+        next_step: str,
+    ) -> str:
+        """Return the final outcome of a generic browser goal."""
+        try:
+            normalized_status = _normalize_completion_status(status)
+        except ValueError:
+            return _fail_decision_json("complete_goal_invalid_status", step_summary, next_step)
+
+        if (
+            normalized_status == "completed"
+            and runtime.goal_type != "extract"
+            and not await _verification_is_current()
+        ):
+            return _decision_json(
+                action="verify",
+                analysis=(
+                    "Completion was attempted without a current verification step. "
+                    "Call verify_goal with explicit success criteria before complete_goal."
+                ),
+                verified=False,
+                step_summary="Completion needs verification before finalizing the goal.",
+                next_step="Call verify_goal before declaring the task complete.",
+            )
+
+        normalized_goal_summary = _normalize_tool_text(goal_summary) if goal_summary.strip() else None
+        if normalized_goal_summary is None:
+            return _fail_decision_json("complete_goal_missing_summary", step_summary, next_step)
+        normalized_evidence = _normalize_tool_text(evidence) if evidence.strip() else evidence
+        normalized_confidence = _normalize_confidence_value(confidence)
+
+        return _decision_json(
+            action="complete",
+            status=normalized_status,
+            goal_summary=normalized_goal_summary,
+            result_data=result_data,
+            evidence=normalized_evidence,
+            confidence=normalized_confidence,
             step_summary=step_summary,
             next_step=next_step,
         )
@@ -1084,7 +1469,21 @@ def _build_tools(runtime: _Runtime):
         """Stop execution with a concrete failure reason."""
         return _fail_decision_json(reason, step_summary, next_step)
 
-    return [type_and_submit, click, navigate, extract_answer, fail]
+    return [
+        analyze_page,
+        verify_goal,
+        type_and_submit,
+        fill,
+        submit,
+        select_option,
+        check,
+        wait_for,
+        click,
+        navigate,
+        extract_answer,
+        complete_goal,
+        fail,
+    ]
 
 
 def _build_graph(runtime: _Runtime):
@@ -1103,140 +1502,602 @@ def _build_graph(runtime: _Runtime):
         with start_span(
             name=f"capture.{state['step'] + 1}",
             span_type="task",
-            metadata={"run_id": runtime.trace_id, "step": state["step"]},
+            metadata={"trace_id": runtime.trace_id, "step": state["step"]},
         ) as capture_span:
-            page_state = await capture_state(runtime.page)
-            page_state.markdown = await page_to_markdown(
+            page_state: PageState | None = None
+            last_error: Exception | None = None
+            for attempt, timeout in enumerate(
+                [_SNAPSHOT_CAPTURE_TIMEOUT_SECONDS, _SNAPSHOT_CAPTURE_TIMEOUT_SECONDS + 10.0]
+            ):
+                try:
+                    async with asyncio.timeout(timeout):
+                        page_state = await runtime.snapshot_service.capture(
+                            force=(attempt > 0),
+                        )
+                    break
+                except TimeoutError as exc:
+                    last_error = exc
+                    if attempt == 0:
+                        span_log(capture_span, output={"warning": "snapshot_timeout_retry", "attempt": attempt})
+                except Exception as exc:
+                    last_error = exc
+                    break
+            if page_state is None:
+                if isinstance(last_error, TimeoutError):
+                    span_log(capture_span, output={"error": "snapshot_timed_out"})
+                    return _set_error(state, "snapshot_timed_out")
+                span_log(capture_span, output={"error": "snapshot_failed", "detail": _error_detail(last_error)})
+                return _set_error(state, "snapshot_failed")
+
+            actual_observation = await _capture_page_observation(
                 runtime.page,
-                selector=runtime.extraction_selector,
+                fallback_url=page_state.url,
+                fallback_title=page_state.title,
             )
+            actual_url = actual_observation["url"]
+            actual_title = actual_observation["title"]
+            if actual_url and page_state.url != actual_url:
+                runtime.snapshot_service.invalidate()
+                try:
+                    async with asyncio.timeout(_SNAPSHOT_CAPTURE_TIMEOUT_SECONDS):
+                        page_state = await runtime.snapshot_service.capture(force=True)
+                except Exception:
+                    page_state = page_state.model_copy(
+                        update={
+                            "url": actual_url,
+                            "title": actual_title or page_state.title,
+                        }
+                    )
+            elif actual_title and not page_state.title.strip():
+                page_state = page_state.model_copy(update={"title": actual_title})
+
+                if actual_url and page_state.url != actual_url:
+                    page_state = page_state.model_copy(
+                        update={
+                            "url": actual_url,
+                            "title": actual_title or page_state.title,
+                        }
+                    )
+
+            state["page_state"] = page_state
+            runtime.current_page_state = page_state
+            runtime.current_trace = state["trace"]
             span_log(
                 capture_span,
                 output={
                     "url": page_state.url,
                     "title": page_state.title,
+                    "page_archetype": page_state.page_archetype,
+                    "page_hints": page_state.page_hints,
+                    "interactable_count": len(page_state.interactables),
                 },
             )
+            return state
 
-        state["page_state"] = page_state
-        return state
+    def _fallback_tool_call(name: str, args: dict[str, Any], *, step: int) -> AIMessage:
+        return AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": name,
+                    "args": args,
+                    "id": f"fallback_{step}_{name}",
+                    "type": "tool_call",
+                }
+            ],
+        )
+
+    def _latest_analysis_step(state: AgentGraphState) -> AgentStepTrace | None:
+        page_state = state.get("page_state")
+        current_url = page_state.url if page_state is not None else ""
+        for item in reversed(state["trace"]):
+            if item.decision.action != "analyze":
+                continue
+            if current_url and item.url != current_url:
+                continue
+            if isinstance(item.decision.result_data, dict):
+                return item
+        return None
+
+    def _is_fallback_analysis_step(step: AgentStepTrace) -> bool:
+        summary = step.decision.step_summary.strip().lower()
+        return summary.startswith("planner fallback after ")
+
+    def _reuse_recent_analysis_message(state: AgentGraphState) -> AIMessage | None:
+        page_state = state.get("page_state")
+        if page_state is None or not state["trace"]:
+            return None
+
+        last_step = state["trace"][-1]
+        if last_step.decision.action != "analyze":
+            return None
+        if last_step.url != page_state.url:
+            return None
+        if not _is_fallback_analysis_step(last_step):
+            return None
+
+        fallback_message = _planner_fallback_message(state, reason="apply_recent_analysis")
+        if fallback_message is None:
+            return None
+        tool_calls = fallback_message.tool_calls or []
+        if not tool_calls:
+            return None
+        tool_name = tool_calls[0].get("name")
+        if tool_name == "analyze_page":
+            return None
+        return fallback_message
+
+    def _planner_fallback_message(
+        state: AgentGraphState,
+        *,
+        reason: str,
+    ) -> AIMessage | None:
+        page_state = state.get("page_state")
+        if page_state is None:
+            return None
+
+        latest_analysis = _latest_analysis_step(state)
+        if latest_analysis is not None:
+            analysis_data = latest_analysis.decision.result_data
+            if isinstance(analysis_data, dict):
+                recommended_action = str(analysis_data.get("recommended_action") or "").strip()
+                interactable_ref = analysis_data.get("recommended_interactable_ref")
+                if not isinstance(interactable_ref, str) or not interactable_ref.strip():
+                    interactable_ref = None
+                recommended_selector = analysis_data.get("recommended_selector")
+                if not isinstance(recommended_selector, str) or not recommended_selector.strip():
+                    recommended_selector = None
+                recommended_value = analysis_data.get("recommended_value")
+                if not isinstance(recommended_value, str) or not recommended_value.strip():
+                    recommended_value = None
+
+                base_args: dict[str, Any] = {
+                    "step_summary": f"Planner fallback after {reason}.",
+                    "next_step": "Continue using the strongest grounded next action.",
+                }
+                if interactable_ref is not None:
+                    base_args["interactable_ref"] = interactable_ref
+                if recommended_selector is not None:
+                    base_args["selector"] = recommended_selector
+
+                if recommended_action == "navigate" and (recommended_value or interactable_ref):
+                    args = dict(base_args)
+                    if recommended_value is not None:
+                        args["url"] = recommended_value
+                    return _fallback_tool_call("navigate", args, step=state["step"])
+
+                if recommended_action == "click" and (interactable_ref or recommended_selector):
+                    return _fallback_tool_call("click", base_args, step=state["step"])
+
+                if recommended_action == "wait_for" and (interactable_ref or recommended_selector):
+                    args = dict(base_args)
+                    args["state"] = "visible"
+                    args["timeout_ms"] = 1500
+                    return _fallback_tool_call("wait_for", args, step=state["step"])
+
+                if recommended_action == "type_and_submit" and (interactable_ref or recommended_selector):
+                    query = extract_task_query(runtime.target_prompt)
+                    if query:
+                        args = dict(base_args)
+                        args["text"] = query
+                        return _fallback_tool_call("type_and_submit", args, step=state["step"])
+
+        return _fallback_tool_call(
+            "analyze_page",
+            {
+                "question": "What is the strongest next action on this page based on visible interactables, hrefs, and body content?",
+                "step_summary": f"Planner fallback after {reason}: inspect the page before acting.",
+                "next_step": "Use the analysis result to choose the next grounded browser action.",
+            },
+            step=state["step"],
+        )
+
+    def _grounded_shortcut_message(state: AgentGraphState) -> AIMessage | None:
+        page_state = state.get("page_state")
+        if page_state is None:
+            return None
+
+        task_query = extract_task_query(runtime.target_prompt)
+        if not task_query:
+            return None
+
+        search_progress = search_progress_state(page_state, runtime.target_prompt)
+        destination_required = task_requires_destination_page(runtime.target_prompt)
+        query_matches_page = page_matches_query(page_state, task_query)
+        analysis = fallback_page_analysis(
+            page_state=page_state,
+            target_prompt=runtime.target_prompt,
+            question="What is the strongest next grounded action from the current page state?",
+            error=None,
+        )
+        data = analysis.model_dump(mode="json")
+        recommended_action = str(data.get("recommended_action") or "").strip()
+        interactable_ref = data.get("recommended_interactable_ref")
+        if not isinstance(interactable_ref, str) or not interactable_ref.strip():
+            interactable_ref = None
+        recommended_selector = data.get("recommended_selector")
+        if not isinstance(recommended_selector, str) or not recommended_selector.strip():
+            recommended_selector = None
+        recommended_value = data.get("recommended_value")
+        if not isinstance(recommended_value, str) or not recommended_value.strip():
+            recommended_value = None
+
+        recent_step = state["trace"][-1] if state["trace"] else None
+        if (
+            recent_step is not None
+            and recent_step.url == page_state.url
+            and recent_step.decision.action == recommended_action
+        ):
+            if interactable_ref and recent_step.decision.interactable_ref == interactable_ref:
+                return None
+            if recommended_value and recent_step.decision.url == recommended_value:
+                return None
+
+        needs_result_progress = search_progress == "results_list" or (
+            destination_required
+            and not query_matches_page
+            and search_progress != "search_entry"
+        )
+
+        # Search entry: find the best search input and type the query
+        if search_progress == "search_entry":
+            search_input = next(
+                (item for item in page_state.interactables if is_search_like_input(item)),
+                None,
+            )
+            if search_input is not None and search_input.ref:
+                return _fallback_tool_call(
+                    "type_and_submit",
+                    {
+                        "text": task_query,
+                        "interactable_ref": search_input.ref,
+                        "selector": search_input.selector,
+                        "step_summary": "Grounded shortcut: submit the visible search field with the task query.",
+                        "next_step": "Inspect the resulting page after the query is submitted.",
+                    },
+                    step=state["step"],
+                )
+            if recommended_action == "type_and_submit" and (interactable_ref or recommended_selector):
+                return _fallback_tool_call(
+                    "type_and_submit",
+                    {
+                        "text": task_query,
+                        "interactable_ref": interactable_ref,
+                        "selector": recommended_selector,
+                        "step_summary": "Grounded shortcut: submit the visible search field with the task query.",
+                        "next_step": "Inspect the resulting page after the query is submitted.",
+                    },
+                    step=state["step"],
+                )
+            if recommended_action == "click" and (interactable_ref or recommended_selector):
+                return _fallback_tool_call(
+                    "click",
+                    {
+                        "interactable_ref": interactable_ref,
+                        "selector": recommended_selector,
+                        "step_summary": "Grounded shortcut: open the visible search control before entering the query.",
+                        "next_step": "Use the search field once it is visible.",
+                    },
+                    step=state["step"],
+                )
+
+        # Results list: use best_result_link directly instead of advisor recommendation
+        if needs_result_progress:
+            best_link = best_result_link(page_state, task_query)
+            if best_link is not None and best_link.href:
+                nav_args: dict[str, Any] = {
+                    "step_summary": "Grounded shortcut: navigate to the best matching result link.",
+                    "next_step": "Inspect the destination page after navigation.",
+                }
+                if best_link.ref:
+                    nav_args["interactable_ref"] = best_link.ref
+                nav_args["url"] = best_link.href
+                return _fallback_tool_call("navigate", nav_args, step=state["step"])
+
+            if best_link is not None and best_link.ref:
+                return _fallback_tool_call(
+                    "click",
+                    {
+                        "interactable_ref": best_link.ref,
+                        "selector": best_link.selector,
+                        "step_summary": "Grounded shortcut: click the best matching result link.",
+                        "next_step": "Inspect the destination page after the click.",
+                    },
+                    step=state["step"],
+                )
+
+            # Fall back to advisor recommendation
+            if recommended_action in {"navigate", "click"} and (interactable_ref or recommended_selector or recommended_value):
+                if recommended_action == "navigate" and (interactable_ref or recommended_value):
+                    args: dict[str, Any] = {
+                        "step_summary": "Grounded shortcut: follow the strongest result link from the current page.",
+                        "next_step": "Inspect the destination page after navigation.",
+                    }
+                    if interactable_ref is not None:
+                        args["interactable_ref"] = interactable_ref
+                    if recommended_value is not None:
+                        args["url"] = recommended_value
+                    return _fallback_tool_call("navigate", args, step=state["step"])
+
+                return _fallback_tool_call(
+                    "click",
+                    {
+                        "interactable_ref": interactable_ref,
+                        "selector": recommended_selector,
+                        "step_summary": "Grounded shortcut: open the strongest result from the current page.",
+                        "next_step": "Inspect the destination page after the click.",
+                    },
+                    step=state["step"],
+                )
+
+        return None
+
+    async def _last_ditch_extract(state: AgentGraphState) -> AgentGraphState:
+        """When max_steps is hit, try to extract an answer from the current page
+        instead of returning a bare 'max_steps_exceeded' error."""
+        page_state = state.get("page_state")
+        if page_state is None:
+            return _set_error(state, "max_steps_exceeded")
+
+        current_url = page_state.url or ""
+        current_title = page_state.title or ""
+
+        # Schema fallback: try structured extraction from page markdown
+        if runtime.extraction_schema:
+            try:
+                md = await page_to_markdown(
+                    runtime.page, selector=runtime.extraction_selector
+                )
+            except Exception:
+                md = page_state.markdown
+            fallback = _schema_fallback_decision(
+                extraction_schema=runtime.extraction_schema,
+                markdown=md,
+                fail_reason=None,
+            )
+            if fallback is not None:
+                trace_entry = AgentStepTrace(
+                    step=len(state["trace"]),
+                    url=current_url,
+                    title=current_title,
+                    decision=fallback,
+                )
+                state["trace"] = state["trace"] + [trace_entry]
+                if runtime.on_step:
+                    runtime.on_step(trace_entry)
+                state["result"] = AgentResult(
+                    status="completed",
+                    answer=fallback.answer,
+                    structured_data=fallback.structured_data,
+                    source_url=current_url,
+                    final_url=current_url,
+                    final_title=current_title,
+                    evidence=fallback.evidence,
+                    confidence=fallback.confidence,
+                    trace=state["trace"],
+                )
+                return state
+
+        # Generic fallback: use page title + first chunk of markdown as answer
+        answer_parts: list[str] = []
+        if current_title:
+            answer_parts.append(current_title)
+        if page_state.markdown:
+            snippet = page_state.markdown[:500].strip()
+            if snippet:
+                answer_parts.append(snippet)
+        if answer_parts:
+            answer = "\n".join(answer_parts)
+            decision = AgentDecision(
+                action="extract",
+                answer=answer,
+                confidence=0.3,
+                step_summary="Last-ditch extraction at max_steps: returning page title and content snippet.",
+                next_step="Return the best available answer.",
+            )
+            trace_entry = AgentStepTrace(
+                step=len(state["trace"]),
+                url=current_url,
+                title=current_title,
+                decision=decision,
+            )
+            state["trace"] = state["trace"] + [trace_entry]
+            if runtime.on_step:
+                runtime.on_step(trace_entry)
+            state["result"] = AgentResult(
+                status="completed",
+                answer=answer,
+                source_url=current_url,
+                final_url=current_url,
+                final_title=current_title,
+                evidence="Extracted from page at max_steps limit.",
+                confidence=0.3,
+                trace=state["trace"],
+            )
+            return state
+
+        return _set_error(state, "max_steps_exceeded")
 
     async def llm_node(state: AgentGraphState) -> AgentGraphState:
         if state["result"] is not None or state["page_state"] is None:
             return state
         if state["step"] >= runtime.max_steps:
-            return _set_error(state, "max_steps_exceeded")
+            return await _last_ditch_extract(state)
 
-        base_messages = build_llm_messages(
-            state["page_state"],
-            runtime.target_prompt,
-            history=state["trace"],
-            extraction_schema=runtime.extraction_schema,
-            extraction_selector=runtime.extraction_selector,
-            max_actions_per_step=runtime.max_actions_per_step,
-        )
         with start_span(
-            name=f"planner.{state['step'] + 1}",
-            span_type="llm",
-            metadata={"run_id": runtime.trace_id, "step": state["step"]},
-            input={
-                "target_prompt": runtime.target_prompt,
-                "url": state["page_state"].url,
-                "history_steps": len(state["trace"]),
-                "max_actions_per_step": runtime.max_actions_per_step,
-            },
+            name=f"llm.{state['step'] + 1}",
+            span_type="task",
+            metadata={"trace_id": runtime.trace_id, "step": state["step"]},
         ) as llm_span:
-            llm_calls: list[dict[str, Any]] = []
-            message = await llm_with_tools.ainvoke(
-                base_messages,
-                **_openrouter_invoke_kwargs(runtime, state["step"]),
-            )
-            llm_calls.append(
-                {
-                    "request_messages": _serialize_llm_messages(base_messages),
-                    "response": _serialize_llm_message(message),
-                }
-            )
-            if not isinstance(message, AIMessage):
+            reused_analysis_message = _reuse_recent_analysis_message(state)
+            if reused_analysis_message is not None:
+                tool_calls = reused_analysis_message.tool_calls or []
                 span_log(
                     llm_span,
-                    output={"error": "llm_response_not_ai_message", "llm_calls": llm_calls},
+                    output={
+                        "warning": "skipping_llm_using_recent_analysis",
+                        "tool_names": [str(call.get("name")) for call in tool_calls],
+                        "tool_calls": _tool_call_summaries(tool_calls),
+                    },
                 )
+                state["messages"] = [reused_analysis_message]
+                state["action_observations"] = []
+                return state
+
+            grounded_shortcut = _grounded_shortcut_message(state)
+            if grounded_shortcut is not None:
+                tool_calls = grounded_shortcut.tool_calls or []
+                span_log(
+                    llm_span,
+                    output={
+                        "warning": "skipping_llm_using_grounded_shortcut",
+                        "tool_names": [str(call.get("name")) for call in tool_calls],
+                        "tool_calls": _tool_call_summaries(tool_calls),
+                    },
+                )
+                state["messages"] = [grounded_shortcut]
+                state["action_observations"] = []
+                return state
+
+            ctx_budget = compute_context_budget(
+                state["page_state"],
+                goal_type=runtime.goal_type,
+                extraction_schema=runtime.extraction_schema,
+            )
+            planner_page_state = budget_page_state(
+                state["page_state"],
+                markdown_chars=ctx_budget.markdown_chars,
+                interactable_limit=ctx_budget.interactable_limit,
+            )
+            base_messages = build_llm_messages(
+                planner_page_state,
+                runtime.target_prompt,
+                history=state["trace"],
+                goal_type=runtime.goal_type,
+                task_data=runtime.task_data,
+                sensitive_data=runtime.sensitive_data,
+                extraction_schema=runtime.extraction_schema,
+                extraction_selector=runtime.extraction_selector,
+                max_actions_per_step=runtime.max_actions_per_step,
+                budget=ctx_budget,
+                working_memory=format_scratchpad(runtime.scratchpad),
+            )
+            try:
+                async with asyncio.timeout(_LLM_CALL_TIMEOUT_SECONDS):
+                    message = await llm_with_tools.ainvoke(
+                        base_messages,
+                        **_openrouter_invoke_kwargs(runtime, state["step"]),
+                    )
+            except TimeoutError:
+                fallback_message = _planner_fallback_message(state, reason="llm_timed_out")
+                if fallback_message is None:
+                    span_log(llm_span, output={"error": "llm_timed_out"})
+                    return _set_error(state, "llm_timed_out")
+                message = fallback_message
+                tool_calls = message.tool_calls or []
+                span_log(
+                    llm_span,
+                    output={
+                        "warning": "llm_timed_out_using_fallback_planner",
+                        "tool_names": [str(call.get("name")) for call in tool_calls],
+                        "tool_calls": _tool_call_summaries(tool_calls),
+                    },
+                )
+                state["messages"] = [message]
+                state["action_observations"] = []
+                return state
+            except Exception as exc:
+                fallback_message = _planner_fallback_message(
+                    state,
+                    reason=f"llm_error_{exc.__class__.__name__}",
+                )
+                if fallback_message is None:
+                    span_log(llm_span, output={"error": "llm_invoke_failed", "detail": _error_detail(exc)})
+                    return _set_error(state, "llm_invoke_failed")
+                message = fallback_message
+                tool_calls = message.tool_calls or []
+                span_log(
+                    llm_span,
+                    output={
+                        "warning": "llm_invoke_failed_using_fallback_planner",
+                        "detail": _error_detail(exc),
+                        "tool_names": [str(call.get("name")) for call in tool_calls],
+                        "tool_calls": _tool_call_summaries(tool_calls),
+                    },
+                )
+                state["messages"] = [message]
+                state["action_observations"] = []
+                return state
+            if not isinstance(message, AIMessage):
+                span_log(llm_span, output={"error": "llm_response_not_ai_message"})
                 return _set_error(state, "llm_response_not_ai_message")
 
             tool_calls = message.tool_calls or []
-            retried_for_tool_call = False
             if not tool_calls:
-                retried_for_tool_call = True
-                retry_messages = base_messages + [
-                    HumanMessage(
-                        content=(
-                            "You returned no tool call. "
-                            "Call at least one tool now. "
-                            "Do not repeat a blocked or identical previous action."
+                retry_message: AIMessage | None = None
+                try:
+                    async with asyncio.timeout(_LLM_CALL_TIMEOUT_SECONDS):
+                        retry_message = await llm_with_tools.ainvoke(
+                            base_messages
+                            + [
+                                HumanMessage(
+                                    content=(
+                                        "You returned no tool call. "
+                                        "Call at least one tool now. "
+                                        "Do not repeat a blocked or identical previous action."
+                                    )
+                                )
+                            ],
+                            **_openrouter_invoke_kwargs(runtime, state["step"]),
                         )
+                except TimeoutError:
+                    fallback_message = _planner_fallback_message(state, reason="llm_retry_timed_out")
+                    if fallback_message is None:
+                        span_log(llm_span, output={"error": "llm_retry_timed_out"})
+                        return _set_error(state, "llm_timed_out")
+                    message = fallback_message
+                    tool_calls = message.tool_calls or []
+                except Exception as exc:
+                    fallback_message = _planner_fallback_message(
+                        state,
+                        reason=f"llm_retry_error_{exc.__class__.__name__}",
                     )
-                ]
-                retry_message = await llm_with_tools.ainvoke(
-                    retry_messages,
-                    **_openrouter_invoke_kwargs(runtime, state["step"]),
-                )
-                llm_calls.append(
-                    {
-                        "request_messages": _serialize_llm_messages(retry_messages),
-                        "response": _serialize_llm_message(retry_message),
-                    }
-                )
+                    if fallback_message is None:
+                        span_log(
+                            llm_span,
+                            output={"error": "llm_retry_failed", "detail": _error_detail(exc)},
+                        )
+                        return _set_error(state, "llm_invoke_failed")
+                    message = fallback_message
+                    tool_calls = message.tool_calls or []
                 if isinstance(retry_message, AIMessage):
                     message = retry_message
                     tool_calls = message.tool_calls or []
 
             if not tool_calls:
-                span_log(
-                    llm_span,
-                    output={"error": "llm_returned_no_tool_call", "llm_calls": llm_calls},
-                )
-                return _set_error(state, "llm_returned_no_tool_call")
+                fallback_message = _planner_fallback_message(state, reason="llm_returned_no_tool_call")
+                if fallback_message is None:
+                    span_log(llm_span, output={"error": "llm_returned_no_tool_call"})
+                    return _set_error(state, "llm_returned_no_tool_call")
+                message = fallback_message
+                tool_calls = message.tool_calls or []
             if len(tool_calls) > runtime.max_actions_per_step:
-                if runtime.max_actions_per_step == 1:
-                    span_log(
-                        llm_span,
-                        output={
-                            "error": "llm_returned_multiple_tool_calls",
-                            "llm_calls": llm_calls,
-                        },
-                    )
-                    return _set_error(state, "llm_returned_multiple_tool_calls")
-                span_log(
-                    llm_span,
-                    output={
-                        "error": "llm_returned_too_many_tool_calls",
-                        "llm_calls": llm_calls,
-                    },
-                )
-                return _set_error(state, "llm_returned_too_many_tool_calls")
+                span_log(llm_span, output={"error": "llm_returned_multiple_tool_calls"})
+                return _set_error(state, "llm_returned_multiple_tool_calls")
             if len(tool_calls) > 1 and any(
-                call.get("name") in {"extract_answer", "fail"} for call in tool_calls[:-1]
+                call.get("name") in {"extract_answer", "complete_goal", "fail"} for call in tool_calls[:-1]
             ):
-                span_log(
-                    llm_span,
-                    output={
-                        "error": "llm_returned_invalid_terminal_tool_order",
-                        "llm_calls": llm_calls,
-                    },
-                )
+                span_log(llm_span, output={"error": "llm_returned_invalid_terminal_tool_order"})
                 return _set_error(state, "llm_returned_invalid_terminal_tool_order")
-
+            state["messages"] = [message]
+            state["action_observations"] = []
             span_log(
                 llm_span,
                 output={
                     "tool_names": [str(call.get("name")) for call in tool_calls],
-                    "retried_for_tool_call": retried_for_tool_call,
-                    "llm_calls": llm_calls,
+                    "tool_calls": _tool_call_summaries(tool_calls),
                 },
             )
-            state["messages"] = [message]
-            state["action_observations"] = []
             return state
 
     async def execute_tools_node(state: AgentGraphState) -> AgentGraphState:
@@ -1248,7 +2109,7 @@ def _build_graph(runtime: _Runtime):
         with start_span(
             name=f"execute_tools.{state['step'] + 1}",
             span_type="task",
-            metadata={"run_id": runtime.trace_id, "step": state["step"]},
+            metadata={"trace_id": runtime.trace_id, "step": state["step"]},
         ) as tools_span:
             ai_message = state["messages"][0]
             if not isinstance(ai_message, AIMessage):
@@ -1259,13 +2120,21 @@ def _build_graph(runtime: _Runtime):
             if not tool_calls:
                 span_log(tools_span, output={"error": "llm_returned_no_tool_call"})
                 return _set_error(state, "llm_returned_no_tool_call")
+            if len(tool_calls) > runtime.max_actions_per_step:
+                span_log(tools_span, output={"error": "llm_returned_multiple_tool_calls"})
+                return _set_error(state, "llm_returned_multiple_tool_calls")
 
             tool_messages: list[ToolMessage] = []
             observations: list[ActionObservation] = []
             fallback_page_state = state.get("page_state")
             fallback_url = fallback_page_state.url if fallback_page_state is not None else ""
             fallback_title = fallback_page_state.title if fallback_page_state is not None else ""
-            for i, tool_call in enumerate(tool_calls):
+            executed_tools: list[str] = []
+            executed_tool_calls: list[dict[str, Any]] = []
+
+            _TERMINAL_TOOL_NAMES = frozenset({"extract_answer", "complete_goal", "fail"})
+
+            for call_idx, tool_call in enumerate(tool_calls):
                 tool_name = tool_call.get("name")
                 if not isinstance(tool_name, str) or not tool_name:
                     span_log(tools_span, output={"error": "tool_call_missing_name"})
@@ -1281,33 +2150,34 @@ def _build_graph(runtime: _Runtime):
                     span_log(tools_span, output={"error": "tool_call_args_not_object", "tool_name": tool_name})
                     return _set_error(state, "tool_call_args_not_object")
 
-                with start_span(
-                    name=f"tool.{tool_name}",
-                    span_type="tool",
-                    metadata={
-                        "run_id": runtime.trace_id,
-                        "step": state["step"],
-                        "tool_index": i,
-                    },
-                    input={"args": tool_args},
-                ) as tool_span:
-                    try:
-                        tool_output = await tool_def.ainvoke(tool_args)
-                    except Exception as exc:
-                        span_log(tool_span, error=str(exc))
-                        span_log(tools_span, output={"error": "tool_execution_failed", "tool_name": tool_name})
-                        return _set_error(state, "tool_execution_failed")
+                try:
+                    tool_output = await tool_def.ainvoke(tool_args)
+                except Exception as exc:
+                    span_log(
+                        tools_span,
+                        output={
+                            "error": "tool_execution_failed",
+                            "tool_name": tool_name,
+                            "tool_args": _tool_arg_preview(tool_args),
+                            "detail": _error_detail(exc),
+                        },
+                    )
+                    return _set_error(state, "tool_execution_failed")
 
-                    if not isinstance(tool_output, str):
-                        span_log(tool_span, output={"error": "tool_output_not_string"})
-                        span_log(tools_span, output={"error": "tool_output_not_string", "tool_name": tool_name})
-                        return _set_error(state, "tool_output_not_string")
-
-                    span_log(tool_span, output={"decision_json": _truncate_for_span_log(tool_output)})
+                if not isinstance(tool_output, str):
+                    span_log(
+                        tools_span,
+                        output={
+                            "error": "tool_output_not_string",
+                            "tool_name": tool_name,
+                            "tool_args": _tool_arg_preview(tool_args),
+                        },
+                    )
+                    return _set_error(state, "tool_output_not_string")
 
                 tool_call_id = tool_call.get("id")
                 if not isinstance(tool_call_id, str) or not tool_call_id:
-                    tool_call_id = f"call_{state['step']}_{i}"
+                    tool_call_id = f"call_{state['step']}_{call_idx}"
 
                 tool_messages.append(
                     ToolMessage(
@@ -1316,11 +2186,20 @@ def _build_graph(runtime: _Runtime):
                         tool_call_id=tool_call_id,
                     )
                 )
+                executed_tools.append(tool_name)
+                executed_tool_calls.append({"name": tool_name, "args": tool_args})
 
                 try:
-                    decision = AgentDecision.model_validate_json(tool_output)
+                    _ = AgentDecision.model_validate_json(tool_output)
                 except Exception:
-                    span_log(tools_span, output={"error": "invalid_tool_output", "tool_name": tool_name})
+                    span_log(
+                        tools_span,
+                        output={
+                            "error": "invalid_tool_output",
+                            "tool_name": tool_name,
+                            "tool_args": _tool_arg_preview(tool_args),
+                        },
+                    )
                     return _set_error(state, "invalid_tool_output")
 
                 observations.append(
@@ -1330,18 +2209,20 @@ def _build_graph(runtime: _Runtime):
                         fallback_title=fallback_title,
                     )
                 )
-                span_log(tools_span, metadata={"last_action": decision.action, "tool_name": tool_name})
 
-                if decision.action in {"extract", "fail"}:
-                    break
-                if decision.action in {"type_and_submit", "click", "navigate"} and i < (len(tool_calls) - 1):
-                    # Replan after first state-changing action so subsequent decisions
-                    # can use fresh page state instead of stale pre-action context.
+                # Stop executing further tool calls after a terminal tool
+                if tool_name in _TERMINAL_TOOL_NAMES:
                     break
 
             state["messages"] = tool_messages
             state["action_observations"] = observations
-            span_log(tools_span, output={"tool_calls_executed": len(tool_messages)})
+            span_log(
+                tools_span,
+                output={
+                    "tool_names": executed_tools,
+                    "tool_calls": _tool_call_summaries(executed_tool_calls),
+                },
+            )
             return state
 
     async def post_tool_node(state: AgentGraphState) -> AgentGraphState:
@@ -1350,7 +2231,7 @@ def _build_graph(runtime: _Runtime):
         with start_span(
             name=f"post_tool.{state['step'] + 1}",
             span_type="task",
-            metadata={"run_id": runtime.trace_id, "step": state["step"]},
+            metadata={"trace_id": runtime.trace_id, "step": state["step"]},
         ) as post_span:
             try:
                 page_state = state["page_state"]
@@ -1373,7 +2254,6 @@ def _build_graph(runtime: _Runtime):
                 return _set_error(state, "invalid_tool_output")
 
             for index, decision in enumerate(decisions):
-                span_log(post_span, metadata={"decision_index": index, "action": decision.action})
                 current_observation = (
                     observations[index]
                     if index < len(observations)
@@ -1393,28 +2273,55 @@ def _build_graph(runtime: _Runtime):
                     decision=decision,
                 )
                 state["trace"] = state["trace"] + [step_trace]
+                runtime.scratchpad = update_scratchpad(runtime.scratchpad, step_trace)
                 if runtime.on_step:
                     runtime.on_step(step_trace)
 
+                span_log(
+                    post_span,
+                    output={
+                        "action": decision.action,
+                        "url": current_url,
+                        "title": current_title,
+                        "step_summary": decision.step_summary,
+                        "reason": decision.reason,
+                    },
+                )
+
                 if decision.action == "extract":
                     state["result"] = AgentResult(
+                        status=decision.status or "completed",
+                        goal_summary=decision.goal_summary or decision.answer or decision.step_summary,
+                        result_data=decision.result_data
+                        or decision.structured_data
+                        or ({"answer": decision.answer} if decision.answer is not None else None),
                         answer=decision.answer,
                         structured_data=decision.structured_data,
                         source_url=current_url,
+                        final_url=current_url,
+                        final_title=current_title,
                         evidence=decision.evidence,
                         confidence=decision.confidence,
                         trace=state["trace"],
                     )
-                    span_log(
-                        post_span,
-                        output={
-                            "result": "extract",
-                            "trace_steps": len(state["trace"]),
-                        },
+                    return state
+
+                if decision.action == "complete":
+                    state["result"] = AgentResult(
+                        status=decision.status or "completed",
+                        goal_summary=decision.goal_summary,
+                        result_data=decision.result_data,
+                        source_url=current_url,
+                        final_url=current_url,
+                        final_title=current_title,
+                        evidence=decision.evidence,
+                        confidence=decision.confidence,
+                        trace=state["trace"],
                     )
                     return state
 
                 if decision.action == "fail":
+                    # Attempt schema fallback extraction from page markdown
                     fallback_markdown = page_state.markdown
                     if runtime.extraction_schema:
                         try:
@@ -1439,34 +2346,20 @@ def _build_graph(runtime: _Runtime):
                         state["trace"] = state["trace"] + [fallback_trace]
                         if runtime.on_step:
                             runtime.on_step(fallback_trace)
-
                         state["result"] = AgentResult(
+                            status="completed",
                             answer=fallback_decision.answer,
                             structured_data=fallback_decision.structured_data,
                             source_url=current_url,
+                            final_url=current_url,
+                            final_title=current_title,
                             evidence=fallback_decision.evidence,
                             confidence=fallback_decision.confidence,
                             trace=state["trace"],
                         )
-                        span_log(
-                            post_span,
-                            output={
-                                "result": "fallback_extract",
-                                "trace_steps": len(state["trace"]),
-                            },
-                        )
                         return state
-
-                    span_log(
-                        post_span,
-                        output={
-                            "result": "fail",
-                            "reason": decision.reason or decision.next_step,
-                        },
-                    )
                     return _set_error(state, decision.reason or decision.next_step)
 
-            span_log(post_span, output={"result": "advance"})
             return _advance(state)
 
     def route_after_post_tool(state: AgentGraphState) -> str:
@@ -1503,8 +2396,12 @@ async def run_agent(
     start_url: str,
     target_prompt: str,
     *,
+    goal_type: str | None = None,
+    task_data: Mapping[str, str] | None = None,
+    sensitive_data: Mapping[str, str] | None = None,
     max_steps: int = 10,
     max_actions_per_step: int = 1,
+    max_runtime_seconds: int = 90,
     extraction_schema: dict[str, str] | None = None,
     extraction_selector: str | None = None,
     headless: bool = True,
@@ -1512,8 +2409,18 @@ async def run_agent(
     trace_id: str | None = None,
     trace_parent: str | None = None,
 ) -> AgentResult:
-    if max_actions_per_step < 1 or max_actions_per_step > 4:
-        raise ValueError("max_actions_per_step must be between 1 and 4")
+    if not 1 <= max_actions_per_step <= 3:
+        raise ValueError("max_actions_per_step must be between 1 and 3")
+    if max_runtime_seconds < 1:
+        raise ValueError("max_runtime_seconds must be at least 1")
+    normalized_goal_type = goal_type.strip() if goal_type is not None else None
+    if goal_type is not None and not normalized_goal_type:
+        raise ValueError("goal_type_empty")
+    normalized_task_data = _normalize_task_value_map(task_data, field_name="task_data")
+    normalized_sensitive_data = _normalize_task_value_map(
+        sensitive_data,
+        field_name="sensitive_data",
+    )
     normalized_extraction_schema = _normalize_extraction_schema(extraction_schema)
     normalized_extraction_selector = (
         extraction_selector.strip() if extraction_selector is not None else None
@@ -1522,75 +2429,121 @@ async def run_agent(
         raise ValueError("extraction_selector_empty")
 
     resolved_trace_id = trace_id or _new_trace_id()
+    resolved_trace_parent = trace_parent or export_current_span_parent()
+    span_input = {
+        "start_url": start_url,
+        "target_prompt": target_prompt,
+        "goal_type": normalized_goal_type,
+        "task_data": normalized_task_data,
+        "has_sensitive_data": bool(normalized_sensitive_data),
+        "max_steps": max_steps,
+        "max_actions_per_step": max_actions_per_step,
+        "max_runtime_seconds": max_runtime_seconds,
+        "headless": headless,
+    }
+    pw = None
+    browser = None
+    page = None
+
     with start_span(
-        name="auto_browse_agent_run",
+        "agent.run",
         span_type="task",
-        parent=trace_parent,
+        parent=resolved_trace_parent,
         metadata={
-            "run_id": resolved_trace_id,
+            "trace_id": resolved_trace_id,
+            "goal_type": normalized_goal_type,
             "max_steps": max_steps,
             "max_actions_per_step": max_actions_per_step,
+            "max_runtime_seconds": max_runtime_seconds,
         },
-        input={
-            "start_url": start_url,
-            "target_prompt": target_prompt,
-            "headless": headless,
-            "extraction_schema_fields": sorted(normalized_extraction_schema.keys())
-            if normalized_extraction_schema
-            else None,
-            "extraction_selector": normalized_extraction_selector,
-        },
-        tags=[f"run_id:{resolved_trace_id}"],
     ) as run_span:
-        pw, browser, page = await run_browser(start_url, headless=headless)
-        runtime = _Runtime(
-            openrouter_client=openrouter_client,
-            page=page,
-            target_prompt=target_prompt,
-            max_steps=max_steps,
-            max_actions_per_step=max_actions_per_step,
-            extraction_schema=normalized_extraction_schema,
-            extraction_selector=normalized_extraction_selector,
-            on_step=on_step,
-            trace_id=resolved_trace_id,
-        )
-        graph = _build_graph(runtime)
-
-        initial_state: AgentGraphState = AgentGraphState(
-            step=0,
-            trace=[],
-            page_state=None,
-            result=None,
-            messages=[],
-            action_observations=[],
-        )
-
+        span_log(run_span, input=span_input)
         try:
-            final_state = await graph.ainvoke(initial_state)
+            with start_span(
+                "startup.browser",
+                span_type="task",
+                metadata={"trace_id": resolved_trace_id},
+            ) as startup_span:
+                try:
+                    pw, browser, page = await run_browser(start_url, headless=headless)
+                except Exception as exc:
+                    span_log(startup_span, output={"error": "browser_startup_failed", "detail": _error_detail(exc)})
+                    return AgentResult(status="failed", error="browser_startup_failed", trace=[])
+            runtime = _Runtime(
+                openrouter_client=openrouter_client,
+                page=page,
+                snapshot_service=PageSnapshotService(
+                    page=page,
+                    extraction_selector=normalized_extraction_selector,
+                    capture_state_fn=capture_state,
+                    markdown_fn=page_to_markdown,
+                ),
+                start_url=start_url,
+                target_prompt=target_prompt,
+                goal_type=normalized_goal_type,
+                task_data=normalized_task_data,
+                sensitive_data=normalized_sensitive_data,
+                max_steps=max_steps,
+                max_actions_per_step=max_actions_per_step,
+                extraction_schema=normalized_extraction_schema,
+                extraction_selector=normalized_extraction_selector,
+                on_step=on_step,
+                trace_id=resolved_trace_id,
+            )
+            graph = _build_graph(runtime)
+
+            initial_state: AgentGraphState = AgentGraphState(
+                step=0,
+                trace=[],
+                page_state=None,
+                result=None,
+                messages=[],
+                action_observations=[],
+            )
+
+            async with asyncio.timeout(max_runtime_seconds):
+                final_state = await graph.ainvoke(initial_state)
             result = final_state.get("result")
             if result is None:
-                fallback_result = AgentResult(
+                result = AgentResult(
+                    status="failed",
                     error="graph_finished_without_result",
                     trace=final_state.get("trace", []),
                 )
-                span_log(
-                    run_span,
-                    output={
-                        "error": fallback_result.error,
-                        "trace_steps": len(fallback_result.trace),
-                    },
-                )
-                return fallback_result
             span_log(
                 run_span,
                 output={
-                    "final_result": _result_for_root_span_log(result),
+                    "status": result.status,
+                    "error": result.error,
+                    "trace_steps": len(result.trace),
+                    "goal_summary": result.goal_summary,
+                    "answer": result.answer,
+                    "source_url": result.source_url,
+                    "final_url": result.final_url,
+                    "final_title": result.final_title,
                 },
             )
             return result
+        except asyncio.TimeoutError:
+            span_log(
+                run_span,
+                error="run_timed_out",
+                output={
+                    "trace_id": resolved_trace_id,
+                    "final_url": getattr(page, "url", start_url),
+                },
+            )
+            raise
         except Exception as exc:
-            span_log(run_span, error=str(exc))
+            span_log(
+                run_span,
+                error=f"run_exception:{type(exc).__name__}",
+                metadata={"trace_id": resolved_trace_id},
+            )
             raise
         finally:
-            await browser.close()
-            await pw.stop()
+            if browser is not None:
+                await browser.close()
+            if pw is not None:
+                await pw.stop()
+            flush()

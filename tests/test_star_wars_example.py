@@ -57,9 +57,12 @@ class _DummyClickPage:
         self.evaluate_payloads = []
 
     async def wait_for_selector(self, _selector: str, state: str = "visible", timeout: int = 0) -> None:
+        _ = state
+        _ = timeout
         return None
 
     async def click(self, _selector: str, timeout: int = 0) -> None:
+        _ = timeout
         raise RuntimeError("native click failed")
 
     async def title(self) -> str:
@@ -94,12 +97,12 @@ class _DummyNoEffectActionPage:
         return self._title
 
     async def wait_for_selector(self, _selector: str, state: str = "visible", timeout: int = 0) -> None:
+        _ = state
+        _ = timeout
         return None
 
     async def click(self, _selector: str, timeout: int = 0) -> None:
-        return None
-
-    async def focus(self, _selector: str) -> None:
+        _ = timeout
         return None
 
     async def fill(self, _selector: str, _text: str) -> None:
@@ -109,6 +112,8 @@ class _DummyNoEffectActionPage:
         return None
 
     async def goto(self, url: str, wait_until: str = "domcontentloaded", timeout: int = 0) -> None:
+        _ = wait_until
+        _ = timeout
         self.last_goto_url = url
         return None
 
@@ -129,9 +134,12 @@ class _DummyRoleFallbackClickPage:
         self.clicked_selectors: list[str] = []
 
     async def wait_for_selector(self, _selector: str, state: str = "visible", timeout: int = 0) -> None:
+        _ = state
+        _ = timeout
         return None
 
     async def click(self, selector: str, timeout: int = 0) -> None:
+        _ = timeout
         self.clicked_selectors.append(selector)
         if selector == 'text="IANA"':
             self.url = "https://www.iana.org/domains/reserved"
@@ -162,9 +170,8 @@ class _DummyTypeFallbackPage:
         self.last_text: str | None = None
 
     async def wait_for_selector(self, _selector: str, state: str = "visible", timeout: int = 0) -> None:
-        return None
-
-    async def focus(self, _selector: str) -> None:
+        _ = state
+        _ = timeout
         return None
 
     async def fill(self, selector: str, text: str) -> None:
@@ -203,9 +210,12 @@ class _DummySingleLinkFallbackPage:
         self.clicked_selectors: list[str] = []
 
     async def wait_for_selector(self, _selector: str, state: str = "visible", timeout: int = 0) -> None:
+        _ = state
+        _ = timeout
         return None
 
     async def click(self, selector: str, timeout: int = 0) -> None:
+        _ = timeout
         self.clicked_selectors.append(selector)
         raise RuntimeError("click failed")
 
@@ -455,54 +465,15 @@ class StarWarsExampleTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result.trace), 1)
         self.assertEqual(len(step_updates), 1)
 
-    async def test_allows_multiple_tool_calls_when_configured(self) -> None:
-        state = PageState(
-            url="https://example.com",
-            title="Example",
-            markdown="",
-            interactables=[
-                Interactable(
-                    kind="link",
-                    label="Result",
-                    selector="css=a[href] >> nth=0",
-                    href="/result",
-                )
-            ],
-        )
-        markdown = "# Example\n\nRelease date May 25, 1977\n"
-        step_updates = []
-        page = _DummyClickPage()
-        client = _StubOpenRouterClient(
-            [
-                [_click_tool_call("css=a[href] >> nth=0"), _extract_tool_call()],
-                [_extract_tool_call()],
-            ]
-        )
-
-        with (
-            patch(
-                "agent.run.run_browser",
-                new=AsyncMock(return_value=(_DummyPlaywright(), _DummyBrowser(), page)),
-            ),
-            patch("agent.run.capture_state", new=AsyncMock(return_value=state)),
-            patch("agent.run.page_to_markdown", new=AsyncMock(return_value=markdown)),
-        ):
-            result = await run_agent(
-                openrouter_client=client,
+    async def test_rejects_out_of_range_actions_per_step(self) -> None:
+        with self.assertRaisesRegex(ValueError, "max_actions_per_step must be between 1 and 3"):
+            await run_agent(
+                openrouter_client=_StubOpenRouterClient([[_extract_tool_call()]]),
                 start_url="https://example.com",
                 target_prompt="release date",
                 max_steps=4,
-                max_actions_per_step=2,
-                on_step=step_updates.append,
+                max_actions_per_step=4,
             )
-
-        self.assertIsNone(result.error)
-        self.assertEqual(result.answer, "May 25, 1977")
-        self.assertEqual(result.source_url, "https://example.com/result")
-        self.assertEqual(len(step_updates), 2)
-        self.assertEqual(step_updates[0].decision.action, "click")
-        self.assertEqual(step_updates[1].decision.action, "extract")
-        self.assertEqual(len(client._chat_model.invocations), 2)
 
     async def test_schema_extraction_returns_structured_data(self) -> None:
         state = PageState(
@@ -1039,3 +1010,33 @@ class StarWarsExampleTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.error, "navigate_failed")
         self.assertEqual(len(step_updates), 1)
         self.assertEqual(page.last_goto_url, "https://example.com/next-page")
+
+    async def test_navigate_accepts_relative_hrefs(self) -> None:
+        state = PageState(
+            url="https://example.com",
+            title="Example",
+            markdown="",
+            interactables=[],
+        )
+        markdown = "# Example\n\nTest page\n"
+        page = _DummyNoEffectActionPage()
+
+        with (
+            patch(
+                "agent.run.run_browser",
+                new=AsyncMock(return_value=(_DummyPlaywright(), _DummyBrowser(), page)),
+            ),
+            patch("agent.run.capture_state", new=AsyncMock(return_value=state)),
+            patch("agent.run.page_to_markdown", new=AsyncMock(return_value=markdown)),
+        ):
+            result = await run_agent(
+                openrouter_client=_StubOpenRouterClient(
+                    [[_navigate_tool_call("/shop/buy-iphone")]]
+                ),
+                start_url="https://example.com",
+                target_prompt="navigate test",
+                max_steps=2,
+            )
+
+        self.assertEqual(result.error, "navigate_failed")
+        self.assertEqual(page.last_goto_url, "https://example.com/shop/buy-iphone")

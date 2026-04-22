@@ -143,6 +143,44 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(len(output_logs), 1)
         self.assertEqual(output_logs[0].args[3]["answer"], "May 25, 1977")
 
+    def test_run_redacts_sensitive_data_in_logged_input_payload(self) -> None:
+        with (
+            patch("auto_browse.api.OpenRouterClient.from_env", return_value=object()),
+            patch("auto_browse.api.logger.info") as mock_logger_info,
+            patch(
+                "auto_browse.api.run_agent",
+                new=AsyncMock(
+                    return_value=AgentResult(
+                        status="completed",
+                        goal_summary="Created account",
+                        final_url="https://example.com/welcome",
+                        final_title="Welcome",
+                        evidence="Account confirmation page",
+                        confidence=0.91,
+                        trace=[],
+                    )
+                ),
+            ),
+        ):
+            response = _build_client().post(
+                "/run",
+                headers=_auth_headers(),
+                json=_run_payload(
+                    goal_type="signup",
+                    task_data={"email": "example@email.com"},
+                    sensitive_data={"password": "C0mplexPassword!"},
+                ),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        input_logs = [
+            call
+            for call in mock_logger_info.call_args_list
+            if call.args and call.args[0] == "[run:%s trace:%s] input_payload=%s"
+        ]
+        self.assertEqual(len(input_logs), 1)
+        self.assertEqual(input_logs[0].args[3]["sensitive_data"], {"password": "[REDACTED]"})
+
     def test_middleware_logs_rejected_request(self) -> None:
         with (
             patch("auto_browse.security.logger.info") as mock_logger_info,
@@ -467,7 +505,7 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(mock_run_agent.await_args.kwargs["trace_id"], "trace-generated")
 
-    def test_run_passes_extraction_and_action_budget_options(self) -> None:
+    def test_run_passes_extraction_and_runtime_options(self) -> None:
         with (
             patch("auto_browse.api.OpenRouterClient.from_env", return_value=object()),
             patch(
@@ -493,7 +531,8 @@ class ApiTest(unittest.TestCase):
                 json={
                     "start_url": "https://example.com",
                     "target_prompt": "Extract release date and director",
-                    "max_actions_per_step": 3,
+                    "max_actions_per_step": 1,
+                    "max_runtime_seconds": 45,
                     "extraction_selector": "css=table.infobox",
                     "extraction_schema": {
                         "release_date": "The theatrical release date",
@@ -503,7 +542,8 @@ class ApiTest(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(mock_run_agent.await_args.kwargs["max_actions_per_step"], 3)
+        self.assertEqual(mock_run_agent.await_args.kwargs["max_actions_per_step"], 1)
+        self.assertEqual(mock_run_agent.await_args.kwargs["max_runtime_seconds"], 45)
         self.assertEqual(
             mock_run_agent.await_args.kwargs["extraction_selector"],
             "css=table.infobox",
@@ -514,6 +554,48 @@ class ApiTest(unittest.TestCase):
                 "release_date": "The theatrical release date",
                 "director": "The director name",
             },
+        )
+
+    def test_run_passes_goal_context_maps(self) -> None:
+        with (
+            patch("auto_browse.api.OpenRouterClient.from_env", return_value=object()),
+            patch(
+                "auto_browse.api.run_agent",
+                new=AsyncMock(
+                    return_value=AgentResult(
+                        status="completed",
+                        goal_summary="Searched for a hotel",
+                        result_data={"city": "Madrid"},
+                        final_url="https://example.com/results",
+                        final_title="Hotel results",
+                        evidence="Results page loaded",
+                        confidence=0.8,
+                        trace=[],
+                    )
+                ),
+            ) as mock_run_agent,
+        ):
+            response = _build_client().post(
+                "/run",
+                headers=_auth_headers(),
+                json={
+                    "start_url": "https://example.com",
+                    "target_prompt": "Find a hotel",
+                    "goal_type": "search",
+                    "task_data": {"city": "Madrid", "guests": "2"},
+                    "sensitive_data": {"password": "secret"},
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_run_agent.await_args.kwargs["goal_type"], "search")
+        self.assertEqual(
+            mock_run_agent.await_args.kwargs["task_data"],
+            {"city": "Madrid", "guests": "2"},
+        )
+        self.assertEqual(
+            mock_run_agent.await_args.kwargs["sensitive_data"],
+            {"password": "secret"},
         )
 
 
