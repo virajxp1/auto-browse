@@ -77,9 +77,13 @@ async def _first_unique_selector(page: Page, candidates: list[str | None], fallb
                 except Exception:
                     continue
             if visible_index is not None:
-                # :nth-match requires a plain CSS selector — strip any Playwright
-                # engine prefix (css=, role=, text=, etc.) before wrapping.
-                css_candidate = re.sub(r"^[a-z]+=", "", candidate)
+                # :nth-match only accepts CSS selectors. Strip `css=` prefix if
+                # present; skip disambiguation for other engine types (role=,
+                # text=, xpath=) since stripping their prefix corrupts matching.
+                non_css_engine = re.match(r"^(?!css=)[a-z]+=", candidate)
+                if non_css_engine:
+                    return candidate
+                css_candidate = candidate[4:] if candidate.startswith("css=") else candidate
                 return f":nth-match({css_candidate}, {visible_index + 1})"
     return fallback
 

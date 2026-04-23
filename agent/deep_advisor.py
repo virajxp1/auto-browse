@@ -186,16 +186,18 @@ _ARCHETYPE_SUBAGENTS: dict[str, list[str]] = {
 
 def _select_subagents(page_archetype: str | None, *, for_verify: bool = False) -> list[dict]:
     """Return the subagent list appropriate for the given page archetype."""
+    archetype_names = _ARCHETYPE_SUBAGENTS.get(page_archetype or "", [])
+
+    if not archetype_names:
+        # Unknown archetype: use all subagents (goal-verifier already included)
+        return _SUBAGENTS
+
     names: list[str] = []
     if for_verify:
         names.append("goal-verifier")
-    archetype_names = _ARCHETYPE_SUBAGENTS.get(page_archetype or "", [])
     for name in archetype_names:
         if name not in names:
             names.append(name)
-    if not names:
-        # Default: include all subagents
-        return _SUBAGENTS
     return [_SUBAGENTS_BY_NAME[n] for n in names if n in _SUBAGENTS_BY_NAME]
 
 

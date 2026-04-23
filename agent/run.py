@@ -768,7 +768,9 @@ def _build_tools(runtime: _Runtime):
                 runtime.last_verification_passed = None
                 runtime.last_verification_url = None
                 runtime.snapshot_service.invalidate()
-                runtime.current_page_state = None
+                # Do NOT clear current_page_state here: subsequent tool calls
+                # within the same multi-action step still need it to resolve
+                # interactable refs via _resolve_action_target.
 
             return _decision_json(action, step_summary, next_step, **decision_kwargs)
         except Exception:
