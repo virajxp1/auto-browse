@@ -107,6 +107,14 @@ def _simplify_page(html: str, url: str) -> str:
     return "\n".join(parts)[:_MAX_PAGE_CHARS]
 
 
+def _augment_with_aria(page_desc: str, aria: str | None) -> str:
+    """Append ARIA accessibility tree to page description if available."""
+    if not aria:
+        return page_desc
+    combined = f"{page_desc}\n\nACCESSIBILITY TREE (use role+name for reliable selectors):\n{aria[:1_500]}"
+    return combined[:_MAX_PAGE_CHARS]
+
+
 # ── LLM action planner ────────────────────────────────────────────────────────
 
 _ACTION_SYSTEM = """\
@@ -248,7 +256,7 @@ class NavigationLoop:
     async def run(self, goal: str, start_url: str) -> NavigationResult:
         history: list[str] = []
 
-        async with BrowserSession(headless=True, timeout_ms=30_000) as session:
+        async with BrowserSession(headless=True, timeout_ms=30_000, url=start_url) as session:
             await session.navigate(start_url)
             logger.info("[nav] started at %s", start_url)
 
@@ -260,7 +268,8 @@ class NavigationLoop:
                     await asyncio.sleep(0.5)
                 html = await session.get_html()
                 url = session.get_url()
-                page_desc = _simplify_page(html, url)
+                aria = await session.get_aria_snapshot()
+                page_desc = _augment_with_aria(_simplify_page(html, url), aria)
 
                 action = await _decide_action(goal, page_desc, step, history, self._client)
                 logger.info(

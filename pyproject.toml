@@ -19,6 +19,9 @@ dependencies = [
   "uvicorn>=0.30.0",
   "scrapegraphai>=1.13.0",
   "rebrowser-playwright>=1.52.0",
+  "instructor>=1.15.1",
+  "crawl4ai>=0.8.6",
+  "camoufox>=0.4.11",
 ]
 
 [build-system]
