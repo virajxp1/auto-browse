@@ -44,6 +44,23 @@ def _is_valid_url(url: str) -> bool:
         return False
 
 
+def _build_fallback_url(site_hint: str) -> str:
+    hint = site_hint.strip()
+    if not hint:
+        return ""
+
+    if hint.startswith("//"):
+        hint = hint[2:]
+    elif "://" in hint:
+        hint = urlsplit(hint).netloc
+
+    hint = hint.split("/", 1)[0].strip()
+    if not hint:
+        return ""
+
+    return f"https://{hint}"
+
+
 async def route_subtask(subtask: SubTask, *, client: LLMClient) -> str:
     raw = await client.json_completion(
         system=_SYSTEM_PROMPT,
@@ -59,7 +76,9 @@ async def route_subtask(subtask: SubTask, *, client: LLMClient) -> str:
         logger.info("[%s] Routed to: %s", subtask.task_id, url)
         return url
 
-    hint = subtask.site_hint.strip().lstrip("https://").lstrip("http://")
-    fallback = f"https://{hint}"
+    fallback = _build_fallback_url(subtask.site_hint)
+    if not _is_valid_url(fallback):
+        raise ValueError(f"Invalid site_hint for fallback URL: {subtask.site_hint!r}")
+
     logger.warning("[%s] LLM returned invalid URL %r; falling back to %s", subtask.task_id, url, fallback)
     return fallback

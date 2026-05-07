@@ -71,11 +71,11 @@ def _simplify_page(html: str, url: str) -> str:
         return f"URL: {url}\n\n{md[:_MAX_PAGE_CHARS]}"
 
     soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "noscript", "svg", "head", "footer", "nav"]):
-        tag.decompose()
-
     title_el = soup.find("title")
     title = title_el.get_text(strip=True) if title_el else ""
+
+    for tag in soup(["script", "style", "noscript", "svg", "head", "footer", "nav"]):
+        tag.decompose()
 
     # Interactive elements: everything actionable
     interactive_lines: list[str] = []
