@@ -17,6 +17,8 @@ dependencies = [
   "pydantic>=2.7.0",
   "readability-lxml>=0.8.4.1",
   "uvicorn>=0.30.0",
+  "scrapegraphai>=1.13.0",
+  "rebrowser-playwright>=1.52.0",
 ]
 
 [build-system]
@@ -25,7 +27,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["agent*", "auto_browse*"]
+include = ["agent*", "auto_browse*", "auto_browse_v2*"]
 
 [tool.setuptools.package-data]
 agent = ["*.ini"]
