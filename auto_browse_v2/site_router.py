@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
 
 from auto_browse_v2.llm_client import LLMClient
@@ -35,6 +37,24 @@ Subtask:
   params: {params}
 """
 
+# Domains where DDG search finds exact deep-link pages better than LLM guessing
+_DDG_PREFERRED_DOMAINS = {
+    "developer.mozilla.org",
+    "docs.python.org",
+    "docs.pytest.org",
+    "playwright.dev",
+    "npmjs.com",
+    "docs.docker.com",
+    "docs.github.com",
+    "nodejs.org",
+    "docs.djangoproject.com",
+    "react.dev",
+    "vuejs.org",
+    "fastapi.tiangolo.com",
+}
+
+_ddg_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ddg-worker")
+
 
 def _is_valid_url(url: str) -> bool:
     try:
@@ -61,19 +81,82 @@ def _build_fallback_url(site_hint: str) -> str:
     return f"https://{hint}"
 
 
+def _ddg_search_sync(query: str, max_results: int = 5) -> list[str]:
+    """Run DuckDuckGo search synchronously — called in executor."""
+    try:
+        from ddgs import DDGS
+        results = DDGS().text(query, max_results=max_results)
+        return [r["href"] for r in results if r.get("href")]
+    except Exception as exc:
+        logger.warning("[ddg] search failed for %r: %s", query, exc)
+        return []
+
+
+def _url_matches_hint(url: str, site_hint: str) -> bool:
+    """Check if a DDG result URL belongs to the expected domain."""
+    try:
+        result_host = urlsplit(url).hostname or ""
+        hint_host = urlsplit(f"https://{site_hint}" if "://" not in site_hint else site_hint).hostname or ""
+        hint_host = hint_host.lstrip("www.")
+        result_host = result_host.lstrip("www.")
+        return hint_host in result_host or result_host in hint_host
+    except Exception:
+        return False
+
+
+def _should_use_ddg(site_hint: str) -> bool:
+    """Return True if this domain benefits from DDG search for exact deep-links."""
+    hint_lower = site_hint.lower()
+    return any(d in hint_lower for d in _DDG_PREFERRED_DOMAINS)
+
+
+async def _ddg_lookup(query: str, site_hint: str) -> str | None:
+    """Search DDG and return the first result URL matching site_hint, or None."""
+    loop = asyncio.get_running_loop()
+    urls = await loop.run_in_executor(_ddg_executor, _ddg_search_sync, query)
+    for url in urls:
+        if _url_matches_hint(url, site_hint):
+            logger.info("[ddg] found matching URL for %r: %s", query, url)
+            return url
+    logger.debug("[ddg] no matching URL for hint %r among %d results", site_hint, len(urls))
+    return None
+
+
 async def route_subtask(subtask: SubTask, *, client: LLMClient) -> str:
-    raw = await client.json_completion(
-        system=_SYSTEM_PROMPT,
-        user=_USER_TEMPLATE.format(
-            description=subtask.description,
-            site_hint=subtask.site_hint,
-            params=subtask.params or {},
-        ),
+    # Run DDG search and LLM URL generation in parallel
+    use_ddg = _should_use_ddg(subtask.site_hint)
+    ddg_query = f"{subtask.description} site:{subtask.site_hint}" if use_ddg else ""
+
+    if use_ddg:
+        ddg_task = asyncio.create_task(_ddg_lookup(ddg_query, subtask.site_hint))
+    else:
+        ddg_task = None
+
+    llm_task = asyncio.create_task(
+        client.json_completion(
+            system=_SYSTEM_PROMPT,
+            user=_USER_TEMPLATE.format(
+                description=subtask.description,
+                site_hint=subtask.site_hint,
+                params=subtask.params or {},
+            ),
+        )
     )
+
+    # Prefer DDG result for docs domains — it's more accurate than LLM for exact pages
+    if ddg_task is not None:
+        ddg_url, raw = await asyncio.gather(ddg_task, llm_task)
+        if ddg_url and _is_valid_url(ddg_url):
+            logger.info("[%s] DDG URL selected: %s", subtask.task_id, ddg_url)
+            llm_task.cancel()
+            return ddg_url
+    else:
+        raw = await llm_task
+        ddg_url = None
 
     url = str(raw.get("url", "")).strip()
     if _is_valid_url(url):
-        logger.info("[%s] Routed to: %s", subtask.task_id, url)
+        logger.info("[%s] LLM URL: %s", subtask.task_id, url)
         return url
 
     fallback = _build_fallback_url(subtask.site_hint)

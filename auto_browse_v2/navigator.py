@@ -28,7 +28,7 @@ class Action(BaseModel):
 
     model_config = ConfigDict(coerce_numbers_to_str=True, extra="ignore")
 
-    type: str = "extract"             # fill | click | select | press_enter | extract | fail
+    type: str = "extract"             # fill | type | click | select | press_enter | extract | fail
     selector: str | None = None       # CSS selector for the target element
     value: str | None = None          # text to fill or option to select
     extract_prompt: str | None = None # specific extraction instruction (type=extract only)
@@ -128,7 +128,7 @@ On every turn you receive:
 
 Return a JSON object with these fields:
 {
-  "type": "fill|click|select|press_enter|extract|fail",
+  "type": "fill|type|click|select|press_enter|extract|fail",
   "selector": "CSS selector for the target element (omit for press_enter/extract/fail)",
   "value": "text to fill or option value to select (omit if not applicable)",
   "extract_prompt": "specific instruction of what to extract (only when type=extract)",
@@ -137,9 +137,10 @@ Return a JSON object with these fields:
 
 ACTION TYPES:
 - fill:        Populate a text input (date picker, search box, etc.)
+- type:        Type text character-by-character into an element (use when fill fails on search boxes)
 - click:       Click a button, link, or interactive element
 - select:      Choose a value from a <select> dropdown
-- press_enter: Press Enter on the focused/last element (use after fill if no submit button)
+- press_enter: Press Enter on the focused/last element (use after fill/type if no submit button)
 - extract:     The CURRENT PAGE already has the data — trigger ScrapeGraphAI extraction
 - fail:        No useful action is possible and no data is available
 
@@ -149,6 +150,14 @@ SELECTOR RULES (in order of preference):
 3. [aria-label="..."] — accessibility labels
 4. button:has-text("Search"), a:has-text("Book") — text-content matchers
 5. Avoid class-based selectors (they change often)
+
+DOCS/PACKAGE SITE STRATEGY (MDN, Playwright, Pytest, npm, Docker docs, PyPI):
+- Step 1: Activate the site search — press "/" on body (works on MDN, Playwright, Pytest, Docker)
+          OR find [placeholder*="Search"] / [aria-label*="search" i] and use type action
+- Step 2: type the specific topic (e.g. "Fetch API", "locators", "skip", "react", "buildx")
+- Step 3: press_enter to submit the search, then click the most relevant result link
+- For npm: search bar at top; type the package name and press Enter
+- NEVER try to navigate the sidebar or TOC — always use search
 
 NAVIGATION STRATEGY:
 - If you see a search form with empty date/destination fields → fill them then click submit
@@ -162,6 +171,7 @@ WHEN TO EXTRACT:
 - You see hotel room prices with the requested dates
 - You see a flight results list with prices and times
 - You see the specific data requested in the goal
+- You are on the exact documentation page for the topic in the goal
 """
 
 
@@ -203,8 +213,24 @@ async def _execute(page: Page, action: Action) -> str:
     if t == "fill":
         if not sel:
             raise ValueError("fill requires a selector")
-        await page.fill(sel, val, timeout=_SELECTOR_TIMEOUT_MS)
+        try:
+            await page.fill(sel, val, timeout=_SELECTOR_TIMEOUT_MS)
+        except Exception:
+            # Fallback: click to focus then type character-by-character
+            await page.click(sel, timeout=_SELECTOR_TIMEOUT_MS)
+            await page.keyboard.type(val, delay=30)
         return f"filled {sel!r} with {val!r}"
+
+    elif t == "type":
+        # Keyboard typing — works on search inputs that reject programmatic fill
+        target = sel or "body"
+        if sel:
+            try:
+                await page.click(sel, timeout=_SELECTOR_TIMEOUT_MS)
+            except Exception:
+                pass  # element may already be focused
+        await page.keyboard.type(val, delay=30)
+        return f"typed {val!r} into {target!r}"
 
     elif t == "click":
         if not sel:
@@ -231,8 +257,9 @@ async def _execute(page: Page, action: Action) -> str:
 
     elif t == "press_enter":
         target = sel or "body"
-        await page.press(target, "Enter", timeout=_SELECTOR_TIMEOUT_MS)
-        return f"pressed Enter on {target!r}"
+        key = val if val and val not in ("", "Enter") else "Enter"
+        await page.press(target, key, timeout=_SELECTOR_TIMEOUT_MS)
+        return f"pressed {key!r} on {target!r}"
 
     else:
         return f"no-op for type={t!r}"
