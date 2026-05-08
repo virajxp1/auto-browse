@@ -85,17 +85,19 @@ class BrowserSession:
             "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
         )
 
-    async def _start_camoufox(self) -> None:
+    async def _start_camoufox(self) -> bool:
+        """Start camoufox. Returns True on success, False if unavailable (ImportError)."""
         try:
             from camoufox.async_api import AsyncCamoufox
         except ImportError:
             logger.warning("camoufox not installed — staying with rebrowser")
-            return
+            return False
         logger.info("[browser] switching to camoufox (Firefox) for bot-detection bypass")
         self._camoufox_browser = AsyncCamoufox(headless=self._headless)
         browser = await self._camoufox_browser.__aenter__()
         self._page = await browser.new_page()
         self._use_camoufox = True
+        return True
 
     async def _close_rebrowser(self) -> None:
         if self._browser is not None:
@@ -160,8 +162,13 @@ class BrowserSession:
             if _is_bot_challenge(html):
                 logger.info("[browser] bot challenge detected at %s — restarting with camoufox", url)
                 await self._close_rebrowser()
-                await self._start_camoufox()
-                await self._goto(url)
+                started = await self._start_camoufox()
+                if started:
+                    await self._goto(url)
+                else:
+                    # camoufox unavailable — restore rebrowser so _page is valid
+                    await self._start_rebrowser()
+                    await self._goto(url)
 
     async def get_html(self) -> str:
         for attempt in range(3):

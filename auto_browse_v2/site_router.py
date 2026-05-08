@@ -84,13 +84,20 @@ def _ddg_search_sync(query: str, max_results: int = 5) -> list[str]:
 
 
 def _url_matches_hint(url: str, site_hint: str) -> bool:
-    """Check if a DDG result URL belongs to the expected domain."""
+    """Check if a DDG result URL belongs to the expected domain.
+
+    The result host must equal the hint host or be a subdomain of it —
+    never the other way around, to prevent attacker-controlled hosts like
+    'evildeveloper.mozilla.org.evil.com' from matching 'developer.mozilla.org'.
+    """
     try:
-        result_host = urlsplit(url).hostname or ""
-        hint_host = urlsplit(f"https://{site_hint}" if "://" not in site_hint else site_hint).hostname or ""
-        hint_host = hint_host.lstrip("www.")
-        result_host = result_host.lstrip("www.")
-        return hint_host in result_host or result_host in hint_host
+        result_host = (urlsplit(url).hostname or "").lstrip("www.").lower()
+        raw_hint = f"https://{site_hint}" if "://" not in site_hint else site_hint
+        hint_host = (urlsplit(raw_hint).hostname or "").lstrip("www.").lower()
+        if not result_host or not hint_host:
+            return False
+        # result must equal hint or be a subdomain: result ends with ".{hint}"
+        return result_host == hint_host or result_host.endswith(f".{hint_host}")
     except Exception:
         return False
 
@@ -151,11 +158,15 @@ async def route_subtask(subtask: SubTask, *, client: LLMClient) -> str:
 
     # Prefer DDG result for docs domains — it's more accurate than LLM for exact pages
     if ddg_task is not None:
-        ddg_url, raw = await asyncio.gather(ddg_task, llm_task)
-        if ddg_url and _is_valid_url(ddg_url):
+        # return_exceptions=True so an LLM failure doesn't discard a valid DDG URL
+        ddg_url, llm_result = await asyncio.gather(ddg_task, llm_task, return_exceptions=True)
+        if ddg_url and not isinstance(ddg_url, BaseException) and _is_valid_url(ddg_url):
             logger.info("[%s] DDG URL selected: %s", subtask.task_id, ddg_url)
-            llm_task.cancel()
             return ddg_url
+        # DDG missed — fall through to LLM result (or re-raise if LLM also failed)
+        if isinstance(llm_result, BaseException):
+            raise llm_result
+        raw = llm_result
     else:
         raw = await llm_task
         ddg_url = None
