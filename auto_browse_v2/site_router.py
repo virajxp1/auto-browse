@@ -37,21 +37,12 @@ Subtask:
   params: {params}
 """
 
-# Domains where DDG search finds exact deep-link pages better than LLM guessing
-_DDG_PREFERRED_DOMAINS = {
-    "developer.mozilla.org",
-    "docs.python.org",
-    "docs.pytest.org",
-    "playwright.dev",
-    "npmjs.com",
-    "docs.docker.com",
-    "docs.github.com",
-    "nodejs.org",
-    "docs.djangoproject.com",
-    "react.dev",
-    "vuejs.org",
-    "fastapi.tiangolo.com",
-}
+# Subdomain/path patterns that signal a technical docs or package-registry site.
+# DDG finds exact deep-link pages on these far better than LLM URL guessing.
+# Pattern-based so it covers any docs site, not just ones we've seen in eval.
+_DOCS_SUBDOMAIN_PATTERNS = ("docs.", "developer.", "developers.", "pkg.", "doc.")
+_DOCS_TLD_PATTERNS = (".dev", ".io/docs", ".io/api")
+_PACKAGE_REGISTRY_HOSTS = ("npmjs.com", "pypi.org", "pkg.go.dev", "crates.io", "rubygems.org")
 
 _ddg_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ddg-worker")
 
@@ -105,9 +96,24 @@ def _url_matches_hint(url: str, site_hint: str) -> bool:
 
 
 def _should_use_ddg(site_hint: str) -> bool:
-    """Return True if this domain benefits from DDG search for exact deep-links."""
-    hint_lower = site_hint.lower()
-    return any(d in hint_lower for d in _DDG_PREFERRED_DOMAINS)
+    """Return True if site_hint looks like a docs/API/package-registry site.
+
+    Uses structural URL patterns (subdomain prefix, TLD suffix, known registries)
+    rather than a hardcoded domain allowlist, so it generalises to new sites.
+    """
+    h = site_hint.lower()
+    # Strip scheme and www prefix properly (not lstrip which strips chars)
+    for prefix in ("https://www.", "http://www.", "https://", "http://", "www."):
+        if h.startswith(prefix):
+            h = h[len(prefix):]
+            break
+    if any(h.startswith(p) for p in _DOCS_SUBDOMAIN_PATTERNS):
+        return True
+    if any(p in h for p in _DOCS_TLD_PATTERNS):
+        return True
+    if any(r in h for r in _PACKAGE_REGISTRY_HOSTS):
+        return True
+    return False
 
 
 async def _ddg_lookup(query: str, site_hint: str) -> str | None:
