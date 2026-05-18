@@ -83,6 +83,11 @@ def _ddg_search_sync(query: str, max_results: int = 5) -> list[str]:
         return []
 
 
+def _strip_www_prefix(host: str) -> str:
+    host = host.lower()
+    return host[4:] if host.startswith("www.") else host
+
+
 def _url_matches_hint(url: str, site_hint: str) -> bool:
     """Check if a DDG result URL belongs to the expected domain.
 
@@ -91,9 +96,9 @@ def _url_matches_hint(url: str, site_hint: str) -> bool:
     'evildeveloper.mozilla.org.evil.com' from matching 'developer.mozilla.org'.
     """
     try:
-        result_host = (urlsplit(url).hostname or "").lstrip("www.").lower()
+        result_host = _strip_www_prefix(urlsplit(url).hostname or "")
         raw_hint = f"https://{site_hint}" if "://" not in site_hint else site_hint
-        hint_host = (urlsplit(raw_hint).hostname or "").lstrip("www.").lower()
+        hint_host = _strip_www_prefix(urlsplit(raw_hint).hostname or "")
         if not result_host or not hint_host:
             return False
         # result must equal hint or be a subdomain: result ends with ".{hint}"

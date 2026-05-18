@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from urllib.parse import urlparse
 
 try:
     from rebrowser_playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
@@ -86,18 +85,33 @@ class BrowserSession:
         )
 
     async def _start_camoufox(self) -> bool:
-        """Start camoufox. Returns True on success, False if unavailable (ImportError)."""
+        """Start camoufox. Returns True on success, False on any startup failure."""
         try:
             from camoufox.async_api import AsyncCamoufox
         except ImportError:
             logger.warning("camoufox not installed — staying with rebrowser")
             return False
         logger.info("[browser] switching to camoufox (Firefox) for bot-detection bypass")
-        self._camoufox_browser = AsyncCamoufox(headless=self._headless)
-        browser = await self._camoufox_browser.__aenter__()
-        self._page = await browser.new_page()
-        self._use_camoufox = True
-        return True
+
+        camoufox_browser: object | None = None
+        try:
+            camoufox_browser = AsyncCamoufox(headless=self._headless)
+            browser = await camoufox_browser.__aenter__()
+            self._camoufox_browser = camoufox_browser
+            self._page = await browser.new_page()
+            self._use_camoufox = True
+            return True
+        except Exception as exc:
+            logger.warning("[browser] camoufox startup failed (%s) — falling back to rebrowser", exc)
+            if camoufox_browser is not None:
+                try:
+                    await camoufox_browser.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            self._camoufox_browser = None
+            self._use_camoufox = False
+            self._page = None
+            return False
 
     async def _close_rebrowser(self) -> None:
         if self._browser is not None:

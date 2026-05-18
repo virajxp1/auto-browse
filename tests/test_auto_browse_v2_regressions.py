@@ -5,7 +5,7 @@ import unittest
 
 from auto_browse_v2.models import SubTask
 from auto_browse_v2.navigator import _simplify_page
-from auto_browse_v2.site_router import route_subtask
+from auto_browse_v2.site_router import _url_matches_hint, route_subtask
 
 
 class _StubClient:
@@ -17,6 +17,13 @@ class _StubClient:
 
 
 class AutoBrowseV2RegressionsTest(unittest.TestCase):
+    def test_url_matches_hint_does_not_strip_non_www_prefix_chars(self) -> None:
+        self.assertFalse(_url_matches_hint("https://ord.com/docs", "word.com"))
+        self.assertFalse(_url_matches_hint("https://evil.ord.com/docs", "word.com"))
+
+    def test_url_matches_hint_allows_www_equivalence(self) -> None:
+        self.assertTrue(_url_matches_hint("https://example.com/docs", "www.example.com"))
+
     def test_route_subtask_fallback_preserves_bare_domain(self) -> None:
         subtask = SubTask(task_id="t1", description="Find rates", site_hint="hyatt.com")
         url = asyncio.run(route_subtask(subtask, client=_StubClient({"url": "not-a-url"})))
